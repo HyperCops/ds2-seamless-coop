@@ -277,8 +277,8 @@ void SessionManager::AddPlayer(uint64_t playerId, const std::string& name) {
     LOG_INFO("Player joined session: %s (ID: %llu) [Total: %zu players]",
              name.c_str(), playerId, m_players.size());
 
-    // Show notification + play sound
-    UI::Overlay::GetInstance().ShowNotification(name + " joined the session", 4.0f);
+    // DS2-style centered notification is shown by packet_handler.cpp (HandleHandshake).
+    // Only play the system sound here — no duplicate bottom-left notification.
     PlaySoundW(L"SystemAsterisk", nullptr, SND_ALIAS | SND_ASYNC);
 
     // Ensure seamless mode is active now that we have a real co-op partner
@@ -305,8 +305,9 @@ void SessionManager::RemovePlayer(uint64_t playerId) {
     LOG_INFO("Player left session: %s (ID: %llu) [Total: %zu players]",
              name.c_str(), playerId, m_players.size());
 
+    // DS2-style centered notification is shown by packet_handler.cpp (Disconnect case).
+    // Only play the system sound here — no duplicate bottom-left notification.
     if (!name.empty()) {
-        UI::Overlay::GetInstance().ShowNotification(name + " left the session", 4.0f);
         PlaySoundW(L"SystemExclamation", nullptr, SND_ALIAS | SND_ASYNC);
     }
 

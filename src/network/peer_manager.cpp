@@ -32,9 +32,19 @@ constexpr uint32_t PACKET_MAGIC_ENCRYPTED = 0x44533245; // 'DS2E' — paquet chi
 constexpr uint64_t HEARTBEAT_INTERVAL_MS = 5000;
 constexpr uint64_t TIMEOUT_DURATION_MS = 60000; // 60s — peers on Hamachi can have bursty latency
 
+// steady_clock — for internal timeouts/intervals (monotonic, doesn't jump)
 static uint64_t NowMs() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()
+    ).count();
+}
+
+// system_clock — for packet timestamps that cross machine boundaries.
+// NTP keeps system clocks within ~10ms on LAN/Hamachi, so the difference
+// between two machines' system_clock values is a valid latency estimate.
+static uint64_t NowSystemMs() {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()
     ).count();
 }
 
@@ -437,7 +447,7 @@ void PeerManager::HandleIncomingPackets() {
                     // embedded timestamp.  Works reliably on LAN/Hamachi where clocks
                     // are within a few seconds of each other (NTP).  Clamped to 0–5000 ms.
                     if (header->type == PacketType::Heartbeat && header->timestamp > 0) {
-                        uint64_t now = NowMs();
+                        uint64_t now = NowSystemMs(); // must match the sender's system_clock
                         if (now >= header->timestamp) {
                             uint64_t diff = now - header->timestamp;
                             if (diff < 5000) {
@@ -605,11 +615,13 @@ void PeerManager::SendHeartbeats() {
     if (now - m_lastHeartbeatMs < HEARTBEAT_INTERVAL_MS) return;
 
     PacketHeader heartbeat{};
-    heartbeat.magic = PACKET_MAGIC;
-    heartbeat.type = PacketType::Heartbeat;
-    heartbeat.size = sizeof(PacketHeader);
-    heartbeat.sequence = 0;
-    heartbeat.timestamp = now;
+    heartbeat.magic     = PACKET_MAGIC;
+    heartbeat.type      = PacketType::Heartbeat;
+    heartbeat.size      = sizeof(PacketHeader);
+    heartbeat.sequence  = 0;
+    // Use system_clock so the receiver on a different machine can compute
+    // latency by subtracting this value from their own system_clock reading.
+    heartbeat.timestamp = NowSystemMs();
 
     BroadcastPacket(&heartbeat);
     m_lastHeartbeatMs = now;
