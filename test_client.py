@@ -36,7 +36,8 @@ PT_ITEM_PICKUP    = 0x33
 PT_SOULS_GRANTED  = 0x35
 PT_ZONE_TRANSIT   = 0x36
 
-MAGIC = 0x44533243  # 'DS2C'
+MAGIC           = 0x44533243  # 'DS2C' — paquet en clair
+MAGIC_ENCRYPTED = 0x44533245  # 'DS2E' — chiffré AES-GCM (header lisible, payload non)
 
 # ── Struct helpers ─────────────────────────────────────────────────────────────
 # PacketHeader : uint32 magic | uint8 type | uint32 size | uint32 seq | uint64 ts
@@ -121,8 +122,13 @@ def recv_loop(sock):
             if len(data) < HEADER_SIZE:
                 continue
             magic, ptype, size, seq, ts = struct.unpack_from("<IBII Q", data, 0)
+            if magic == MAGIC_ENCRYPTED:
+                # Header en clair, payload chiffré — on affiche juste le type
+                name = pt_name(ptype)
+                print(f"  [RX] {name} [chiffré] (seq={seq}, size={size})")
+                continue
             if magic != MAGIC:
-                print(f"  [RX] Paquet invalide (magic={magic:#010x}) ignoré")
+                print(f"  [RX] Paquet inconnu (magic={magic:#010x}) ignoré")
                 continue
             name = pt_name(ptype)
             print(f"  [RX] {name} (seq={seq}, size={size})")
