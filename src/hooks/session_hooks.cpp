@@ -234,6 +234,12 @@ static bool IsIncomingDisconnect(const char* className) {
     // RejectSign can also carry a "phantom returned home" state that crashes
     // the host when processed mid-session.
     if (strstr(className, "RejectSign")) return true;
+    // Block all invasion-related messages while seamless co-op is active.
+    // BreakInTarget   = invader requesting to enter our world
+    // PushBreakIn*    = server pushing the invasion to us
+    // We silently drop these so invaders can't interrupt the co-op session.
+    if (strstr(className, "BreakIn")) return true;
+    if (strstr(className, "PushBreakIn")) return true;
     return false;
 }
 

@@ -137,6 +137,7 @@ struct PeerInfo {
     uint16_t port;
     uint64_t lastHeartbeat;
     bool connected;
+    uint32_t ping_ms = 0;   // one-way latency estimate (ms), updated on each heartbeat received
 };
 
 // Peer manager for handling connections

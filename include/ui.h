@@ -36,7 +36,12 @@ public:
 
     void ShowConnectionMenu();
     void ShowPlayerList();
+    // Standard notification (bottom-left, white text)
     void ShowNotification(const std::string& message, float duration = 3.0f);
+
+    // DS2-style centered notification (à la covenant message)
+    // type: 0=info (white), 1=join (amber/gold), 2=death (red), 3=zone (cyan)
+    void ShowCenteredNotification(const std::string& message, float duration = 4.0f, int type = 0);
 
     bool IsVisible() const { return m_visible; }
     void SetVisible(bool visible) { m_visible = visible; }
@@ -72,9 +77,12 @@ private:
     struct Notification {
         std::string message;
         float timeRemaining;
-        uint32_t id = 0;
+        uint32_t id   = 0;
+        bool centered = false; // true = DS2-style centered message
+        int  type     = 0;     // 0=white 1=amber(join) 2=red(death) 3=cyan(zone)
     };
     std::vector<Notification> m_notifications;
+    std::vector<Notification> m_centeredNotifs; // separate list for centered messages
     uint32_t m_nextNotifId = 1;
     mutable std::mutex m_notifMutex; // protects m_notifications from concurrent access
 };

@@ -376,6 +376,14 @@ void SessionManager::UpdatePlayerLevel(uint64_t playerId, uint32_t soulLevel) {
     }
 }
 
+void SessionManager::UpdatePlayerPing(uint64_t playerId, uint32_t ping_ms) {
+    std::lock_guard<std::mutex> lock(m_playersMutex);
+    SessionPlayer* player = GetPlayer(playerId);
+    if (player) {
+        player->ping_ms = ping_ms;
+    }
+}
+
 void SessionManager::NotifyPlayerDeath(uint64_t playerId) {
     bool shouldBroadcast = false;
     {

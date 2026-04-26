@@ -830,21 +830,47 @@ void Overlay::RenderPlayerHUD() {
 
         ImGui::SameLine(0, 6);
 
-        // ── Name ────────────────────────────────────────────────────────────
+        // ── Name + ping ─────────────────────────────────────────────────────
         const std::string& name = p.playerName.empty() ? "(unnamed)" : p.playerName;
 
         if (isDead) {
             ImGui::TextColored(ImVec4(0.45f, 0.45f, 0.45f, 1.0f), "%s", name.c_str());
             ImGui::SameLine();
-            ImGui::TextColored(ImVec4(0.55f, 0.30f, 0.30f, 1.0f), "[mort]");
+            ImGui::TextColored(ImVec4(0.55f, 0.30f, 0.30f, 1.0f), "[dead]");
         } else if (isLocal) {
             ImGui::TextColored(ImVec4(0.50f, 1.0f, 0.55f, 1.0f), "%s", name.c_str());
         } else {
             ImGui::TextUnformatted(name.c_str());
+
+            // Ping indicator — only for remote players with a known ping
+            if (p.ping_ms > 0) {
+                ImGui::SameLine();
+                ImVec4 pingColor;
+                if      (p.ping_ms <  80) pingColor = {0.35f, 0.85f, 0.35f, 0.85f}; // green  < 80ms
+                else if (p.ping_ms < 150) pingColor = {0.90f, 0.75f, 0.20f, 0.85f}; // yellow < 150ms
+                else                      pingColor = {0.90f, 0.25f, 0.20f, 0.85f}; // red    >= 150ms
+                char pingBuf[16];
+                snprintf(pingBuf, sizeof(pingBuf), "%ums", p.ping_ms);
+                ImGui::TextColored(pingColor, "%s", pingBuf);
+            }
         }
     }
 
     ImGui::End();
+}
+
+// ============================================================================
+// ShowCenteredNotification — DS2-style centered message
+// ============================================================================
+void Overlay::ShowCenteredNotification(const std::string& message, float duration, int type) {
+    std::lock_guard<std::mutex> lock(m_notifMutex);
+    Notification n;
+    n.message       = message;
+    n.timeRemaining = duration;
+    n.id            = m_nextNotifId++;
+    n.centered      = true;
+    n.type          = type;
+    m_centeredNotifs.push_back(n);
 }
 
 // ============================================================================
@@ -902,6 +928,65 @@ void Overlay::RenderNotifications() {
             std::remove_if(m_notifications.begin(), m_notifications.end(),
                 [](const Notification& n) { return n.timeRemaining <= 0.0f; }),
             m_notifications.end()
+        );
+    }
+
+    // ── Centered DS2-style notifications ─────────────────────────────────────
+    std::vector<Notification> centeredSnap;
+    {
+        std::lock_guard<std::mutex> lock(m_notifMutex);
+        if (m_centeredNotifs.empty()) goto tick_centered;
+        centeredSnap = m_centeredNotifs;
+    }
+    {
+        // Colors per type: 0=white, 1=amber(join), 2=red(death), 3=cyan(zone)
+        static const ImVec4 kColors[] = {
+            {1.0f,  1.0f,  1.0f,  1.0f},   // 0 white
+            {0.98f, 0.78f, 0.25f, 1.0f},   // 1 amber  — join/leave
+            {0.85f, 0.22f, 0.18f, 1.0f},   // 2 red    — death
+            {0.40f, 0.88f, 0.95f, 1.0f},   // 3 cyan   — zone
+        };
+
+        float screenW = io.DisplaySize.x;
+        float screenH = io.DisplaySize.y;
+        float baseY   = screenH * 0.72f; // ~lower third, like DS2 covenant messages
+
+        ImGuiWindowFlags cf = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoInputs
+                            | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove
+                            | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_AlwaysAutoResize
+                            | ImGuiWindowFlags_NoBringToFrontOnFocus;
+
+        int idx = 0;
+        for (auto& n : centeredSnap) {
+            if (n.timeRemaining <= 0.0f) { idx++; continue; }
+            float alpha  = (n.timeRemaining < 1.0f) ? n.timeRemaining : 1.0f;
+            ImVec4 col   = kColors[n.type < 4 ? n.type : 0];
+            col.w        = alpha;
+
+            ImGui::SetNextWindowBgAlpha(alpha * 0.72f);
+            // Position: centered horizontally, stacked vertically
+            ImGui::SetNextWindowPos(
+                ImVec2(screenW * 0.5f, baseY - idx * 36.0f),
+                ImGuiCond_Always, ImVec2(0.5f, 1.0f));
+
+            char wid[32]; snprintf(wid, sizeof(wid), "##cnotif%u", n.id);
+            ImGui::Begin(wid, nullptr, cf);
+            ImGui::PushStyleColor(ImGuiCol_Text, col);
+            ImGui::TextUnformatted(n.message.c_str());
+            ImGui::PopStyleColor();
+            ImGui::End();
+            idx++;
+        }
+    }
+
+tick_centered:
+    {
+        std::lock_guard<std::mutex> lock(m_notifMutex);
+        for (auto& n : m_centeredNotifs) n.timeRemaining -= dt;
+        m_centeredNotifs.erase(
+            std::remove_if(m_centeredNotifs.begin(), m_centeredNotifs.end(),
+                [](const Notification& n) { return n.timeRemaining <= 0.0f; }),
+            m_centeredNotifs.end()
         );
     }
 }

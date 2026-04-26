@@ -400,6 +400,50 @@ void ProgressSync::WaitForPartyAtFogGate(uint32_t fogGateId) {
 }
 
 // ============================================================================
+// DumpStateToNewPeer
+//
+// Called by PeerManager right after a new peer's handshake is accepted.
+// Sends all event flags (boss kills, general flags) and lit bonfires
+// that were recorded during this session to the new joiner so their
+// game state matches the rest of the party.
+//
+// We target the specific peer (peerId) rather than broadcasting to avoid
+// spamming peers who already have these flags.
+// ============================================================================
+void ProgressSync::DumpStateToNewPeer(uint64_t peerId) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+
+    size_t flagsSent = 0;
+
+    // ── Boss kills / general event flags ─────────────────────────────────────
+    for (uint32_t flagId : m_defeatedBosses) {
+        Network::BossDefeatedPacket pkt{};
+        pkt.header.magic    = 0x44533243;
+        pkt.header.type     = Network::PacketType::BossDefeated;
+        pkt.header.size     = sizeof(Network::BossDefeatedPacket);
+        pkt.header.sequence = 0;
+        pkt.bossId          = flagId;
+        pkt.defeatTime      = 0;
+        Network::PeerManager::GetInstance().SendPacket(&pkt.header, peerId);
+        flagsSent++;
+    }
+
+    // ── Lit bonfires ──────────────────────────────────────────────────────────
+    for (uint32_t bonfireId : m_litBonfires) {
+        Network::EventFlagPacket pkt{};
+        pkt.header.magic    = 0x44533243;
+        pkt.header.type     = Network::PacketType::BonfireRest;
+        pkt.header.size     = sizeof(Network::EventFlagPacket);
+        pkt.flagId          = bonfireId;
+        pkt.flagValue       = true;
+        Network::PeerManager::GetInstance().SendPacket(&pkt.header, peerId);
+        flagsSent++;
+    }
+
+    LOG_INFO("[STATE-DUMP] Sent %zu flags/bonfires to new peer %llu", flagsSent, peerId);
+}
+
+// ============================================================================
 // SyncZoneTransition
 //
 // Called locally when the local player's warp is detected (LastBonfire

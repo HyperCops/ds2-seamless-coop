@@ -425,15 +425,32 @@ void PeerManager::HandleIncomingPackets() {
             return;
         }
 
-        // Update peer heartbeat under lock
+        // Update peer heartbeat (and ping estimate for Heartbeat packets) under lock
         PeerInfo senderInfo{};
         {
             std::lock_guard<std::recursive_mutex> lock(m_peersMutex);
             for (auto& peer : m_peers) {
                 if (peer.address == pkt.sender.sin_addr.s_addr) {
                     peer.lastHeartbeat = NowMs();
-                    senderInfo.playerId = peer.playerId;
+
+                    // Ping estimate: difference between our clock and the sender's
+                    // embedded timestamp.  Works reliably on LAN/Hamachi where clocks
+                    // are within a few seconds of each other (NTP).  Clamped to 0–5000 ms.
+                    if (header->type == PacketType::Heartbeat && header->timestamp > 0) {
+                        uint64_t now = NowMs();
+                        if (now >= header->timestamp) {
+                            uint64_t diff = now - header->timestamp;
+                            if (diff < 5000) {
+                                peer.ping_ms = static_cast<uint32_t>(diff);
+                                DS2Coop::Session::SessionManager::GetInstance()
+                                    .UpdatePlayerPing(peer.playerId, peer.ping_ms);
+                            }
+                        }
+                    }
+
+                    senderInfo.playerId   = peer.playerId;
                     senderInfo.playerName = peer.playerName;
+                    senderInfo.ping_ms    = peer.ping_ms;
                     break;
                 }
             }
@@ -521,6 +538,9 @@ void PeerManager::HandleHandshakePacket(const HandshakePacket* hs, const sockadd
 
             DS2Coop::Hooks::ProtobufHooks::SetSeamlessActive(true);
             LOG_INFO("[SEAMLESS] First peer connected — seamless mode ON");
+
+            // Send all known event flags / bonfires so the new joiner is in sync
+            DS2Coop::Sync::ProgressSync::GetInstance().DumpStateToNewPeer(hs->playerId);
         }
 
         // Send handshake response back so the joiner knows we accepted

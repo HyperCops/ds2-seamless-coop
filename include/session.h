@@ -26,6 +26,7 @@ struct SessionPlayer {
     int32_t maxHealth;
     bool isAlive;
     bool isReady;
+    uint32_t ping_ms = 0;   // latency in ms, 0 = local player or unknown
 };
 
 // Session manager for co-op sessions
@@ -59,6 +60,7 @@ public:
     void UpdatePlayerPosition(uint64_t playerId, float x, float y, float z);
     void UpdatePlayerHealth(uint64_t playerId, int32_t health, int32_t maxHealth);
     void UpdatePlayerLevel(uint64_t playerId, uint32_t soulLevel);
+    void UpdatePlayerPing(uint64_t playerId, uint32_t ping_ms);
     void NotifyPlayerDeath(uint64_t playerId);
     void NotifyPlayerRespawn(uint64_t playerId);
     

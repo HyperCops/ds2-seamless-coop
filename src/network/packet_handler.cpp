@@ -6,6 +6,7 @@
 #include "../../include/session.h"
 #include "../../include/sync.h"
 #include "../../include/utils.h"
+#include "../../include/ui.h"
 #include <unordered_map>
 
 using namespace DS2Coop::Network;
@@ -37,6 +38,8 @@ void PacketHandler::HandlePacket(const PacketHeader* packet, const PeerInfo& sen
             {
                 auto& sessionMgr = DS2Coop::Session::SessionManager::GetInstance();
                 sessionMgr.RemovePlayer(sender.playerId);
+                std::string msg = sender.playerName + " has left the session";
+                DS2Coop::UI::Overlay::GetInstance().ShowCenteredNotification(msg, 4.0f, 1);
             }
             break;
 
@@ -55,6 +58,8 @@ void PacketHandler::HandlePacket(const PacketHeader* packet, const PeerInfo& sen
             {
                 auto& sessionMgr = DS2Coop::Session::SessionManager::GetInstance();
                 sessionMgr.NotifyPlayerDeath(sender.playerId);
+                std::string msg = sender.playerName + " has died";
+                DS2Coop::UI::Overlay::GetInstance().ShowCenteredNotification(msg, 4.0f, 2);
             }
             break;
 
@@ -63,6 +68,8 @@ void PacketHandler::HandlePacket(const PacketHeader* packet, const PeerInfo& sen
             {
                 auto& sessionMgr = DS2Coop::Session::SessionManager::GetInstance();
                 sessionMgr.NotifyPlayerRespawn(sender.playerId);
+                std::string msg = sender.playerName + " has respawned";
+                DS2Coop::UI::Overlay::GetInstance().ShowCenteredNotification(msg, 3.0f, 0);
             }
             break;
 
@@ -108,6 +115,10 @@ void PacketHandler::HandlePacket(const PacketHeader* packet, const PeerInfo& sen
                         DS2Coop::Sync::ProgressSync::GetBonfireName(zp->bonfireId);
                     LOG_INFO("[ZONE] %s warped to '%s' (bonfire %u) — executing local warp",
                              sender.playerName.c_str(), bonfireName, zp->bonfireId);
+                    {
+                        std::string msg = sender.playerName + " warped to " + bonfireName;
+                        DS2Coop::UI::Overlay::GetInstance().ShowCenteredNotification(msg, 4.0f, 3);
+                    }
                     DS2Coop::Sync::ProgressSync::ExecuteBonfireWarp(zp->bonfireId);
                 } else {
                     LOG_DEBUG("[ZONE] %s respawned (death) — not syncing",
@@ -146,6 +157,9 @@ void PacketHandler::HandleHandshake(const HandshakePacket* packet, const PeerInf
     // Register this player in the session
     auto& sessionMgr = DS2Coop::Session::SessionManager::GetInstance();
     sessionMgr.AddPlayer(packet->playerId, packet->playerName);
+
+    std::string msg = std::string(packet->playerName) + " has joined the session";
+    DS2Coop::UI::Overlay::GetInstance().ShowCenteredNotification(msg, 5.0f, 1);
 }
 
 void PacketHandler::RemovePlayer(uint64_t playerId) {

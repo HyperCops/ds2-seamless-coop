@@ -72,6 +72,10 @@ public:
     // Returns "Bonfire #XXXXX" if the ID is not in the lookup table.
     static const char* GetBonfireName(uint32_t bonfireId);
 
+    // Send all currently known event flags (boss kills, lit bonfires) to a
+    // specific peer who just joined.  Called by PeerManager after handshake.
+    void DumpStateToNewPeer(uint64_t peerId);
+
 private:
     ProgressSync() = default;
     ~ProgressSync() = default;
