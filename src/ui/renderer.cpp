@@ -37,6 +37,7 @@
 #include "../../include/ui.h"
 #include "../../include/hooks.h"
 #include "../../include/session.h"
+#include "../../include/network.h"
 #include "../../include/utils.h"
 
 using namespace DS2Coop::Utils;
@@ -261,7 +262,7 @@ static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* swapChain, UINT s
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
 
-    // Persistent HUD badge — always visible, shows player count when in session
+    // ── Badge HUD (coin supérieur gauche) ─────────────────────────────────────
     {
         ImGui::SetNextWindowPos(ImVec2(10.0f, 10.0f), ImGuiCond_Always);
         ImGui::SetNextWindowBgAlpha(0.55f);
@@ -283,6 +284,94 @@ static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* swapChain, UINT s
         ImGui::SameLine();
         ImGui::TextDisabled("| INSERT");
         ImGui::End();
+    }
+
+    // ── Panneau joueurs distants (coin supérieur droit) ────────────────────────
+    // Inspiré des mods Seamless Co-op de LukeYui (DS1/DS3/ER) :
+    // un panneau par joueur distant avec nom, barre de PV colorée et niveau d'âme.
+    {
+        auto& sessionMgr = DS2Coop::Session::SessionManager::GetInstance();
+        if (sessionMgr.IsActive()) {
+            auto players = sessionMgr.GetPlayers();
+            uint64_t localId = DS2Coop::Network::PeerManager::GetInstance().GetLocalPlayerId();
+
+            ImGuiWindowFlags pFlags =
+                ImGuiWindowFlags_NoDecoration     | ImGuiWindowFlags_NoInputs      |
+                ImGuiWindowFlags_NoNav            | ImGuiWindowFlags_NoMove        |
+                ImGuiWindowFlags_NoSavedSettings  | ImGuiWindowFlags_NoBringToFrontOnFocus |
+                ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_AlwaysAutoResize;
+
+            // Largeur fixe du panneau joueur
+            constexpr float PANEL_W    = 200.0f;
+            constexpr float PANEL_GAP  = 6.0f;
+            constexpr float HP_BAR_H   = 6.0f;
+            constexpr float MARGIN_TOP = 10.0f;
+
+            ImGuiIO& io = ImGui::GetIO();
+            float panelX = io.DisplaySize.x - PANEL_W - 10.0f;
+            float panelY = MARGIN_TOP;
+
+            int panelIndex = 0;
+            for (const auto& p : players) {
+                if (p.playerId == localId) continue; // ne pas s'afficher soi-même
+
+                char wid[32];
+                snprintf(wid, sizeof(wid), "##player_%d", panelIndex++);
+
+                ImGui::SetNextWindowPos(ImVec2(panelX, panelY), ImGuiCond_Always);
+                ImGui::SetNextWindowSize(ImVec2(PANEL_W, 0), ImGuiCond_Always);
+                ImGui::SetNextWindowBgAlpha(0.72f);
+                ImGui::Begin(wid, nullptr, pFlags);
+
+                // ── Nom + état ──────────────────────────────────────────────
+                if (!p.isAlive && p.maxHealth > 0) {
+                    ImGui::TextColored(ImVec4(0.55f, 0.55f, 0.55f, 1.0f),
+                        "%s  [died]", p.playerName.c_str());
+                } else {
+                    ImGui::TextColored(ImVec4(0.90f, 0.85f, 0.70f, 1.0f),
+                        "%s", p.playerName.c_str());
+                }
+
+                // ── Barre de PV ─────────────────────────────────────────────
+                if (p.maxHealth > 0) {
+                    float frac = static_cast<float>(p.health) /
+                                 static_cast<float>(p.maxHealth);
+                    if (frac < 0.0f) frac = 0.0f;
+                    if (frac > 1.0f) frac = 1.0f;
+
+                    // Couleur : vert → jaune → rouge (comme les mods Yui)
+                    ImVec4 barCol = frac > 0.5f
+                        ? ImVec4(0.15f + (1.0f - frac) * 1.3f, 0.70f, 0.15f, 1.0f)
+                        : ImVec4(0.80f, frac * 1.4f, 0.10f, 1.0f);
+
+                    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, barCol);
+                    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.12f, 0.12f, 0.12f, 1.0f));
+                    ImGui::ProgressBar(frac, ImVec2(-1.0f, HP_BAR_H), "");
+                    ImGui::PopStyleColor(2);
+
+                    // Valeurs HP en petit sous la barre
+                    ImGui::SetWindowFontScale(0.80f);
+                    ImGui::TextColored(ImVec4(0.60f, 0.60f, 0.60f, 1.0f),
+                        "%d / %d", p.health, p.maxHealth);
+                    ImGui::SetWindowFontScale(1.0f);
+                } else {
+                    ImGui::TextDisabled("HP: ---");
+                }
+
+                // ── Niveau d'âme ────────────────────────────────────────────
+                if (p.soulLevel > 0) {
+                    ImGui::SetWindowFontScale(0.80f);
+                    ImGui::TextColored(ImVec4(0.70f, 0.55f, 0.20f, 1.0f),
+                        "SL %u", p.soulLevel);
+                    ImGui::SetWindowFontScale(1.0f);
+                }
+
+                float winH = ImGui::GetWindowHeight();
+                ImGui::End();
+
+                panelY += winH + PANEL_GAP;
+            }
+        }
     }
 
     overlay.Render();

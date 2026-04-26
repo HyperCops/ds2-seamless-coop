@@ -6,6 +6,7 @@ add_library(ds2_seamless_coop SHARED
     hooks/game_state_hooks.cpp
     network/peer_manager.cpp
     network/packet_handler.cpp
+    network/crypto.cpp
     session/session_manager.cpp
     sync/progress_sync.cpp
     sync/player_sync.cpp
@@ -35,7 +36,7 @@ target_link_libraries(ds2_seamless_coop PRIVATE
 
 # Set output name and compiler flags
 set_target_properties(ds2_seamless_coop PROPERTIES
-    OUTPUT_NAME "ds2_seamless_coop"
+    OUTPUT_NAME "dinput8"   # DS2 auto-loads dinput8.dll at startup — no launcher needed
     PREFIX ""
     MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>"
 )
@@ -45,11 +46,6 @@ target_compile_options(ds2_seamless_coop PRIVATE
     $<$<CONFIG:Release>:/MT>
     $<$<CONFIG:Debug>:/MTd>
 )
-
-# Also build as dinput8.dll (drop-in auto-load, no launcher needed)
-add_custom_command(TARGET ds2_seamless_coop POST_BUILD
-    COMMAND ${CMAKE_COMMAND} -E copy
-    $<TARGET_FILE:ds2_seamless_coop>
-    ${CMAKE_BINARY_DIR}/bin/$<CONFIG>/dinput8.dll
-)
+# No POST_BUILD copy needed — OUTPUT_NAME "dinput8" + CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE
+# already puts dinput8.dll directly in repo/dist/
 

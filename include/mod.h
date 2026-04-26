@@ -1,6 +1,7 @@
 #pragma once
 
 #include <Windows.h>
+#include <atomic>
 #include <cstdint>
 #include <string>
 
@@ -59,6 +60,7 @@ private:
     void UninstallHooks();
     
     bool m_initialized = false;
+    std::atomic<bool> m_running{false}; // contrôle la boucle du thread, séparé de m_initialized
     GameVersion m_gameVersion = GameVersion::Unknown;
     ModConfig m_config;
     HANDLE m_updateThread = nullptr;

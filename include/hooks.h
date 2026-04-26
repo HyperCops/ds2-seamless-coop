@@ -110,8 +110,17 @@ namespace GameState {
     bool InstallHooks();
     void UninstallHooks();
 
-    using PlayerDeathFunc = void(__fastcall*)(void* playerPtr);
-    using BossDefeatedFunc = void(__fastcall*)(void* bossPtr);
+    // Reset the per-session broadcast-deduplication set.
+    // Call at session create and session leave so boss flags are re-broadcast
+    // to new peers who joined later.
+    void ClearBroadcastFlagCache();
+
+    using PlayerDeathFunc   = void(__fastcall*)(void* playerPtr);
+    using BossDefeatedFunc  = void(__fastcall*)(void* bossPtr);
+    // SetEventFlag: void __fastcall SetEventFlag(void* flagMan, uint32_t flagId, bool value)
+    using SetEventFlagFunc  = void(__fastcall*)(void* flagMan, uint32_t flagId, bool value);
+    // ItemGive: void __fastcall ItemGive(void* bag, void* items, int count, int mode)
+    using ItemGiveFunc      = void(__fastcall*)(void* bag, void* items, int count, int mode);
 }
 
 } // namespace DS2Coop::Hooks

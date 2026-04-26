@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <unordered_map>
 #include <vector>
 #include <string>
 #include <memory>
@@ -34,7 +35,13 @@ enum class PacketType : uint8_t {
     FogGateTransition = 0x32,
     ItemPickup = 0x33,
     EventFlag = 0x34,
-    
+    SoulsGranted = 0x35,  // souls awarded to all players (boss kill, etc.)
+
+    // Zone transition sync (loading screen sync)
+    // Sent when a player warps to a different bonfire / area.
+    // Peers receive this and execute the same warp so everyone ends up together.
+    ZoneTransition = 0x36,
+
     // Custom data
     ChatMessage = 0x40,
     CustomData = 0x41
@@ -90,6 +97,35 @@ struct EventFlagPacket {
     PacketHeader header;
     uint32_t flagId;
     bool flagValue;
+};
+
+// Sent when one player gains souls (boss kill reward).
+// All peers receive this packet and add `souls` to their own soul count.
+struct SoulsGrantedPacket {
+    PacketHeader header;
+    uint32_t souls;         // amount gained
+};
+
+// Sent when a player initiates a bonfire warp.
+// transitionType: 0 = bonfire warp (chosen from menu)
+//                 1 = death respawn (peers do NOT sync this — independent deaths)
+// bonfireId: the destination bonfire ID (PlayerData+0x16C after the warp)
+struct ZoneTransitionPacket {
+    PacketHeader header;
+    uint32_t bonfireId;       // destination bonfire ID
+    uint8_t  transitionType;  // 0=warp, 1=respawn
+};
+
+// Sent when one player picks up a world item (corpse, chest, ground).
+// All peers receive the item via ItemGive.
+struct ItemPickupPacket {
+    PacketHeader header;
+    int32_t  category;      // DS2ItemStruct.type  (3 = consumable, etc.)
+    int32_t  itemId;        // DS2 item ID
+    float    durability;    // FLT_MAX for new items
+    int16_t  quantity;
+    uint8_t  upgrade;       // 0-10
+    uint8_t  infusion;      // 0 = none
 };
 #pragma pack(pop)
 
@@ -156,20 +192,24 @@ private:
 class PacketHandler {
 public:
     static PacketHandler& GetInstance();
-    
+
     void HandlePacket(const PacketHeader* packet, const PeerInfo& sender);
+    void RemovePlayer(uint64_t playerId); // nettoie l'état de séquence du joueur
 
 private:
     PacketHandler() = default;
     ~PacketHandler() = default;
     PacketHandler(const PacketHandler&) = delete;
     PacketHandler& operator=(const PacketHandler&) = delete;
-    
+
     void HandleHandshake(const HandshakePacket* packet, const PeerInfo& sender);
     void HandlePlayerPosition(const PlayerPositionPacket* packet);
     void HandlePlayerState(const PlayerStatePacket* packet);
     void HandleBossDefeated(const BossDefeatedPacket* packet);
     void HandleEventFlag(const EventFlagPacket* packet);
+
+    std::unordered_map<uint64_t, uint32_t> m_lastPosSequence;
+    std::mutex m_seqMutex;
 };
 
 } // namespace DS2Coop::Network

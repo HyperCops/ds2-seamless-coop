@@ -7,7 +7,9 @@
 // Pointer chain: GameManagerImp -> +0x38 (PlayerData) -> offsets
 
 #include "../../include/sync.h"
+#include "../../include/mod.h"
 #include "../../include/session.h"
+#include "../../include/ui.h"
 #include "../../include/network.h"
 #include "../../include/addresses.h"
 #include "../../include/address_resolver.h"
@@ -16,10 +18,20 @@
 #include "../../include/utils.h"
 #include <chrono>
 #include <cfloat>
+#include <cmath>
 
 using namespace DS2Coop::Sync;
 using namespace DS2Coop::Utils;
 using namespace DS2Coop::Addresses;
+
+// ── ItemGive globals ─────────────────────────────────────────────────────────
+// Defined here (before Initialize) so they are visible throughout the entire TU.
+// Declared extern in game_state_hooks.cpp and progress_sync.cpp.
+// Stored as void* to avoid cross-TU function-pointer type conflicts; cast to
+// ItemGiveFunc at each call site within this file.
+void* g_itemGiveFunc    = nullptr;   // set by PlayerSync::Initialize() via AOB scan
+bool  g_itemGiveScanned = false;     // guards the one-shot AOB scan
+bool  g_ourItemGiveCall = false;     // reentrancy guard: true while the mod calls ItemGive
 
 PlayerSync& PlayerSync::GetInstance() {
     static PlayerSync instance;
@@ -176,11 +188,16 @@ static void PatchPhantomDismissalLoops() {
 //   Changing it to 0x06 allows up to 6 players.
 // ============================================================================
 static void PatchPlayerCap() {
+    // Lire max_players depuis la config, clamped entre 2 et 6 (limite physique DS2)
+    uint8_t targetCap = static_cast<uint8_t>(
+        DS2Coop::SeamlessCoopMod::GetInstance().GetConfig().max_players);
+    if (targetCap < 2) targetCap = 2;
+    if (targetCap > 6) targetCap = 6;
+
     uintptr_t exeBase = (uintptr_t)GetModuleHandle(nullptr);
-    // The full instruction is: c7 45 c3 03 00 00 00
-    // We verify the full 7 bytes but only change the 03 to 06
     uintptr_t instrAddr = exeBase + 0x6ab0b6;
 
+    // Instruction attendue : c7 45 c3 03 00 00 00 (MOV dword ptr [RBP+local_6c], 0x3)
     uint8_t expected[] = { 0xc7, 0x45, 0xc3, 0x03, 0x00, 0x00, 0x00 };
     uint8_t actual[7] = {};
 
@@ -191,33 +208,27 @@ static void PatchPlayerCap() {
         return;
     }
 
-    if (memcmp(actual, expected, 7) != 0) {
-        // Check if already patched (03 -> 06)
-        uint8_t patched[] = { 0xc7, 0x45, 0xc3, 0x06, 0x00, 0x00, 0x00 };
-        if (memcmp(actual, patched, 7) == 0) {
-            LOG_INFO("PatchPlayerCap: already patched (cap=6)");
-            return;
-        }
+    // Vérifier si déjà patché avec la valeur cible
+    if (actual[0] == 0xc7 && actual[1] == 0x45 && actual[2] == 0xc3 &&
+        actual[3] == targetCap && actual[4] == 0x00 && actual[5] == 0x00 && actual[6] == 0x00) {
+        LOG_INFO("PatchPlayerCap: already patched (cap=%u)", targetCap);
+    } else if (memcmp(actual, expected, 7) != 0 && actual[3] != 0x03) {
         LOG_WARNING("PatchPlayerCap: bytes at exe+0x6ab0b6 don't match expected "
                     "(got %02X %02X %02X %02X %02X %02X %02X) - skipping",
                     actual[0], actual[1], actual[2], actual[3],
                     actual[4], actual[5], actual[6]);
-        return;
+    } else {
+        DWORD oldProtect = 0;
+        if (!VirtualProtect((void*)instrAddr, 7, PAGE_EXECUTE_READWRITE, &oldProtect)) {
+            LOG_ERROR("PatchPlayerCap: VirtualProtect failed (error %u)", GetLastError());
+            return;
+        }
+        *((uint8_t*)(instrAddr + 3)) = targetCap;
+        VirtualProtect((void*)instrAddr, 7, oldProtect, &oldProtect);
+        LOG_INFO("PatchPlayerCap: PATCHED exe+0x6ab0b9 (local_6c 3->%u)", targetCap);
     }
 
-    DWORD oldProtect = 0;
-    if (!VirtualProtect((void*)instrAddr, 7, PAGE_EXECUTE_READWRITE, &oldProtect)) {
-        LOG_ERROR("PatchPlayerCap: VirtualProtect failed (error %u)", GetLastError());
-        return;
-    }
-
-    // Change 0x03 to 0x06 at the immediate value position
-    *((uint8_t*)(instrAddr + 3)) = 0x06;
-    VirtualProtect((void*)instrAddr, 7, oldProtect, &oldProtect);
-
-    LOG_INFO("PatchPlayerCap: PATCHED exe+0x6ab0b9 (local_6c 3->6)");
-
-    // Second patch: the 0x3 written into the protobuf message struct at [RBX+0x1c]
+    // Second patch : valeur écrite dans le struct protobuf à [RBX+0x1c]
     // 1406ab15b: c7 43 1c 03 00 00 00  MOV dword ptr [RBX+0x1c], 0x3
     uintptr_t msgAddr = exeBase + 0x6ab15b;
     uint8_t expected2[] = { 0xc7, 0x43, 0x1c, 0x03, 0x00, 0x00, 0x00 };
@@ -230,18 +241,18 @@ static void PatchPlayerCap() {
         return;
     }
 
-    if (memcmp(actual2, expected2, 7) == 0) {
+    if (actual2[0] == 0xc7 && actual2[1] == 0x43 && actual2[2] == 0x1c &&
+        actual2[3] == targetCap) {
+        LOG_INFO("PatchPlayerCap: second patch already applied (cap=%u)", targetCap);
+    } else if (memcmp(actual2, expected2, 7) == 0 || actual2[3] == 0x03) {
         DWORD oldProtect2 = 0;
         VirtualProtect((void*)msgAddr, 7, PAGE_EXECUTE_READWRITE, &oldProtect2);
-        *((uint8_t*)(msgAddr + 3)) = 0x06;
+        *((uint8_t*)(msgAddr + 3)) = targetCap;
         VirtualProtect((void*)msgAddr, 7, oldProtect2, &oldProtect2);
-        LOG_INFO("PatchPlayerCap: PATCHED exe+0x6ab15e ([RBX+0x1c] 3->6) - protobuf MaxPlayers=6");
+        LOG_INFO("PatchPlayerCap: PATCHED exe+0x6ab15e ([RBX+0x1c] 3->%u) - protobuf MaxPlayers=%u",
+                 targetCap, targetCap);
     } else {
-        uint8_t patched2[] = { 0xc7, 0x43, 0x1c, 0x06, 0x00, 0x00, 0x00 };
-        if (memcmp(actual2, patched2, 7) == 0)
-            LOG_INFO("PatchPlayerCap: second patch already applied");
-        else
-            LOG_WARNING("PatchPlayerCap: second patch bytes mismatch at exe+0x6ab15b - skipping");
+        LOG_WARNING("PatchPlayerCap: second patch bytes mismatch at exe+0x6ab15b - skipping");
     }
 }
 
@@ -270,6 +281,23 @@ bool PlayerSync::Initialize() {
 
     // Increase player cap from 3 to 6
     PatchPlayerCap();
+
+    // Résoudre ItemGive dès maintenant (scan AOB) pour que GameState::InstallHooks()
+    // qui est appelé juste après puisse immédiatement accrocher la fonction.
+    // On ne fait que le scan — pas besoin du bag pointer pour ça.
+    if (!g_itemGiveScanned) {
+        g_itemGiveScanned = true;
+        uintptr_t addr = DS2Coop::Utils::PatternScanner::FindPattern(
+            ItemGib::ITEM_GIVE_PATTERN,
+            ItemGib::ITEM_GIVE_MASK,
+            nullptr);
+        if (addr) {
+            g_itemGiveFunc = reinterpret_cast<void*>(addr);
+            LOG_INFO("[ITEM] ItemGive trouvé à %p — hook disponible", reinterpret_cast<void*>(addr));
+        } else {
+            LOG_WARNING("[ITEM] ItemGive introuvable — item pickup broadcast indisponible");
+        }
+    }
 
     m_initialized = true;
     LOG_INFO("Player sync initialized");
@@ -533,6 +561,20 @@ void PlayerSync::SyncLocalPlayerPosition() {
 // ============================================================================
 // State sync - reads ACTUAL game memory
 // ============================================================================
+// Lire les âmes courantes (dépensables) depuis la mémoire du jeu.
+static bool ReadPlayerSouls(int32_t& souls) {
+    uintptr_t playerData = 0;
+    if (!ReadPlayerDataBase(playerData)) return false;
+    return Memory::Read<int32_t>(playerData + Offsets::GameManager::Souls, &souls);
+}
+
+// Lire le dernier feu de camp (LastBonfire, PlayerData+0x16C)
+static bool ReadLastBonfire(uint32_t& bonfireId) {
+    uintptr_t playerData = 0;
+    if (!ReadPlayerDataBase(playerData)) return false;
+    return Memory::Read<uint32_t>(playerData + Offsets::GameManager::LastBonfire, &bonfireId);
+}
+
 void PlayerSync::SyncLocalPlayerState() {
     auto& sessionMgr = Session::SessionManager::GetInstance();
     if (!sessionMgr.IsActive()) return;
@@ -546,12 +588,14 @@ void PlayerSync::SyncLocalPlayerState() {
     if (!localPlayer) return;
 
     int32_t health = 0, maxHealth = 0;
-    float stamina = 0;
+    float   stamina = 0;
     uint32_t soulLevel = 0;
+    int32_t  souls = 0;
 
     // Read actual values from game memory
     bool gotHealth = ReadPlayerHealth(health, maxHealth);
-    bool gotLevel = ReadPlayerLevel(soulLevel);
+    bool gotLevel  = ReadPlayerLevel(soulLevel);
+    bool gotSouls  = ReadPlayerSouls(souls);
     ReadPlayerStamina(stamina);
 
     if (gotHealth) {
@@ -567,24 +611,151 @@ void PlayerSync::SyncLocalPlayerState() {
         soulLevel = localPlayer->soulLevel;
     }
 
-    // Build and broadcast state packet
+    // -----------------------------------------------------------------------
+    // Soul-gain detection — "Yui-style" souls distribution
+    //
+    // We track the previous souls value across calls (static).  When souls
+    // increase by more than SOULS_SHARE_MIN (avoids spamming for every
+    // small enemy kill while still catching boss rewards), we broadcast a
+    // SoulsGrantedPacket so peers also receive the same amount.
+    //
+    // This fires on the LOCAL player who did the killing; peers apply the
+    // delta via ApplySoulsGainToMemory() without re-broadcasting.
+    // -----------------------------------------------------------------------
+    // -----------------------------------------------------------------------
+    // Âmes — détection du delta, Yui-style
+    //
+    // On partage TOUTE augmentation d'âmes (seuil = 1) :
+    //   • petits ennemis → quelques dizaines → partagés
+    //   • boss           → milliers          → partagés
+    //   • marchands / dépenses → delta négatif → on met à jour le baseline
+    //     sans broadcaster (la perte est locale au joueur qui a dépensé).
+    //
+    // Les paquets sont envoyés au rythme de SyncLocalPlayerState (0.5 s),
+    // donc plusieurs kills en 0.5 s sont regroupés en un seul paquet delta.
+    // -----------------------------------------------------------------------
+    static int32_t s_prevSouls  = -1;  // -1 = non initialisé
+    static bool    s_soulsReady = false;
+
+    if (gotSouls) {
+        // Sanity check : les âmes DS2 vont de 0 à 99 999 999.
+        // Une valeur hors plage indique un mauvais offset mémoire.
+        constexpr int32_t SOULS_MAX_SANE = 99999999;
+        if (souls < 0 || souls > SOULS_MAX_SANE) {
+            static bool s_warnedOffset = false;
+            if (!s_warnedOffset) {
+                LOG_WARNING("[SOULS] Valeur hors plage (%d) — offset PlayerData+0x%X "
+                            "probablement incorrect. Vérifie Bob Edition CT.",
+                            souls, Offsets::GameManager::Souls);
+                s_warnedOffset = true;
+            }
+            // Ne pas mettre à jour s_prevSouls sur une lecture invalide
+        } else if (!s_soulsReady) {
+            // Premier tick valide — on initialise le baseline sans broadcaster
+            s_prevSouls  = souls;
+            s_soulsReady = true;
+            LOG_INFO("[SOULS] Baseline initialisé : %d âmes (PlayerData+0x%X)",
+                     souls, Offsets::GameManager::Souls);
+        } else if (souls > s_prevSouls) {
+            int32_t delta = souls - s_prevSouls;
+            s_prevSouls = souls;
+
+            // Partager TOUT gain, même 1 âme
+            LOG_DEBUG("[SOULS] +%d âmes détectées — broadcast aux pairs", delta);
+
+            Network::SoulsGrantedPacket sp{};
+            sp.header.magic = 0x44533243;
+            sp.header.type  = Network::PacketType::SoulsGranted;
+            sp.header.size  = sizeof(Network::SoulsGrantedPacket);
+            sp.souls        = static_cast<uint32_t>(delta);
+            Network::PeerManager::GetInstance().BroadcastPacket(&sp.header);
+        } else {
+            // Âmes stables ou diminuées (dépense chez un marchand, mort)
+            s_prevSouls = souls;
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Zone transition detection — "loading screen sync"
+    //
+    // We monitor two things each tick (0.5 s interval):
+    //   1. LastBonfire (PlayerData+0x16C) — changes when the player warps
+    //      to a new bonfire OR dies and respawns at the current one.
+    //   2. Player position — a warp moves the player by tens/hundreds of
+    //      units instantaneously. A respawn at the same bonfire produces a
+    //      small jump (< WARP_DISTANCE_THRESHOLD); a warp elsewhere is large.
+    //
+    // When BOTH change (new bonfire + large position jump), we broadcast a
+    // ZoneTransitionPacket so peers can follow the host to the new area.
+    //
+    // Death respawns produce a small position jump (back to bonfire exit) and
+    // do NOT change LastBonfire — so they are NOT broadcast. Each player
+    // dies and respawns independently.
+    //
+    // The ZONE_SYNC_COOLDOWN prevents double-broadcasting if the position is
+    // read a second time while still on the loading screen.
+    // -----------------------------------------------------------------------
+    m_zoneSyncTimer += STATE_SYNC_INTERVAL; // we're called from stateSyncTimer tick
+
+    uint32_t lastBonfire = 0;
+    bool gotBonfire = ReadLastBonfire(lastBonfire);
+
+    if (gotBonfire && gotHealth) {
+        if (!m_zoneTrackingReady) {
+            // First valid read — seed baseline, don't broadcast
+            m_prevLastBonfire = lastBonfire;
+            float rotDummyInit = 0.0f;
+            ReadPlayerPosition(m_prevPosX, m_prevPosY, m_prevPosZ, rotDummyInit);
+            m_zoneTrackingReady = true;
+        } else if (lastBonfire != m_prevLastBonfire && m_zoneSyncTimer >= ZONE_SYNC_COOLDOWN) {
+            // Bonfire changed — check if position also jumped (= real warp, not just
+            // a different bonfire being read while standing next to one)
+            float cx = 0, cy = 0, cz = 0, rotDummy = 0;
+            if (ReadPlayerPosition(cx, cy, cz, rotDummy)) {
+                float dx = cx - m_prevPosX;
+                float dy = cy - m_prevPosY;
+                float dz = cz - m_prevPosZ;
+                float dist = sqrtf(dx*dx + dy*dy + dz*dz);
+
+                if (dist > WARP_DISTANCE_THRESHOLD) {
+                    LOG_INFO("[ZONE] Warp detected: bonfire %u -> %u, dist=%.1f — broadcasting",
+                             m_prevLastBonfire, lastBonfire, dist);
+
+                    // Only host (or any player) broadcasts their own zone change
+                    // Peers receive it and execute the warp on their side
+                    DS2Coop::Sync::ProgressSync::GetInstance().SyncZoneTransition(lastBonfire, 0);
+                    m_zoneSyncTimer = 0.0f;
+                } else {
+                    LOG_DEBUG("[ZONE] LastBonfire changed but small jump (%.1f) — not a warp", dist);
+                }
+                m_prevPosX = cx; m_prevPosY = cy; m_prevPosZ = cz;
+            }
+            m_prevLastBonfire = lastBonfire;
+        } else {
+            // No bonfire change — just update position baseline for next check
+            float cx = 0, cy = 0, cz = 0, rotDummy = 0;
+            if (ReadPlayerPosition(cx, cy, cz, rotDummy)) {
+                m_prevPosX = cx; m_prevPosY = cy; m_prevPosZ = cz;
+            }
+        }
+    }
+
+    // Build and broadcast standard state packet (HP/stamina/SL for HUD)
     Network::PlayerStatePacket packet{};
-    packet.header.magic = 0x44533243;
-    packet.header.type = Network::PacketType::PlayerState;
-    packet.header.size = sizeof(Network::PlayerStatePacket);
+    packet.header.magic     = 0x44533243;
+    packet.header.type      = Network::PacketType::PlayerState;
+    packet.header.size      = sizeof(Network::PlayerStatePacket);
     packet.header.timestamp = std::chrono::system_clock::now().time_since_epoch().count();
-    packet.playerId = localPlayer->playerId;
-    packet.health = health;
-    packet.maxHealth = maxHealth;
-    packet.stamina = static_cast<int32_t>(stamina);
+    packet.playerId   = localPlayer->playerId;
+    packet.health     = health;
+    packet.maxHealth  = maxHealth;
+    packet.stamina    = static_cast<int32_t>(stamina);
     packet.maxStamina = 100;
-    packet.souls = 0;
-    packet.soulLevel = soulLevel;
+    packet.souls      = gotSouls ? static_cast<uint32_t>(souls) : 0;
+    packet.soulLevel  = soulLevel;
 
     auto& peerMgr = Network::PeerManager::GetInstance();
     peerMgr.BroadcastPacket(&packet.header);
-
-    //LOG_DEBUG("Synced state: HP %d/%d, SL %u", health, maxHealth, soulLevel);
 }
 
 // ============================================================================
@@ -629,29 +800,33 @@ struct DS2ItemStruct {
 
 // x64 fastcall: void ItemGive(void* bag, DS2ItemStruct* items, int count, int mode)
 typedef void (__fastcall *ItemGiveFunc)(void* bag, DS2ItemStruct* items, int count, int mode);
-static ItemGiveFunc g_itemGiveFunc = nullptr;
-static bool g_itemGiveScanned = false;
+
+// (g_itemGiveFunc, g_itemGiveScanned, g_ourItemGiveCall defined at top of file)
 
 // ============================================================================
 // Resolve the ItemGive function and AvailableItemBag pointer
 // ============================================================================
 static bool ResolveItemGive(uintptr_t& outBag) {
-    // Find ItemGive function via AOB (only scan once)
+    // AOB scan already done in PlayerSync::Initialize() — g_itemGiveScanned guards it.
+    // If Initialize() ran first, g_itemGiveFunc is already set (or null if not found).
     if (!g_itemGiveScanned) {
+        // Fallback scan (Initialize not yet called — should not normally happen)
         g_itemGiveScanned = true;
         uintptr_t addr = DS2Coop::Utils::PatternScanner::FindPattern(
             ItemGib::ITEM_GIVE_PATTERN,
             ItemGib::ITEM_GIVE_MASK,
             nullptr);
         if (addr) {
-            g_itemGiveFunc = reinterpret_cast<ItemGiveFunc>(addr);
-            LOG_INFO("ItemGive function found at %p", reinterpret_cast<void*>(addr));
+            g_itemGiveFunc = reinterpret_cast<void*>(addr);
+            LOG_INFO("[ITEM] ItemGive trouvé (scan tardif) à %p", reinterpret_cast<void*>(addr));
         } else {
-            LOG_WARNING("ItemGive function not found — soapstone grant unavailable");
+            LOG_WARNING("[ITEM] ItemGive introuvable — soapstone grant indisponible");
         }
     }
 
     if (!g_itemGiveFunc) return false;
+
+    auto* typedItemGive = reinterpret_cast<ItemGiveFunc>(g_itemGiveFunc);
 
     // Resolve AvailableItemBag: [BaseA] -> +0xA8 -> +0x10 -> +0x10
     auto& resolver = DS2Coop::AddressResolver::GetInstance();
@@ -707,16 +882,19 @@ bool PlayerSync::GrantSoapstones() {
     items[1].upgrade    = 0;
     items[1].infusion   = 0;
 
+    auto* typedItemGive = reinterpret_cast<ItemGiveFunc>(g_itemGiveFunc);
     LOG_INFO("GrantSoapstones: calling ItemGive at %p with bag=%p, 2 items",
-             reinterpret_cast<void*>(g_itemGiveFunc), reinterpret_cast<void*>(bag));
+             g_itemGiveFunc, reinterpret_cast<void*>(bag));
 
     __try {
-        // Give items one at a time to isolate which one crashes (if any)
-        g_itemGiveFunc(reinterpret_cast<void*>(bag), &items[0], 1, 0);
+        // Give items one at a time, flagged so the item-pickup hook ignores our calls
+        g_ourItemGiveCall = true;
+        typedItemGive(reinterpret_cast<void*>(bag), &items[0], 1, 0);
         LOG_INFO("GrantSoapstones: White Sign Soapstone given");
 
-        g_itemGiveFunc(reinterpret_cast<void*>(bag), &items[1], 1, 0);
+        typedItemGive(reinterpret_cast<void*>(bag), &items[1], 1, 0);
         LOG_INFO("GrantSoapstones: Small White Sign Soapstone given");
+        g_ourItemGiveCall = false;
 
         return true;
     }
@@ -724,6 +902,7 @@ bool PlayerSync::GrantSoapstones() {
         LOG_ERROR("GrantSoapstones: ItemGive crashed (exception 0x%08X)",
                   GetExceptionCode());
         // Disable further attempts
+        g_ourItemGiveCall = false;
         g_itemGiveFunc = nullptr;
         return false;
     }
@@ -803,6 +982,13 @@ void PlayerSync::EnableSummoning() {
     } else if (s_scanAttempts <= 10) {
         s_scanAttempts++;
         __try {
+            // TeamType est un uint16 dans la structure du joueur, probablement
+            // dans les premiers 0x800 octets du bloc PlayerData ou NPM.
+            // On réduit la plage pour limiter les faux positifs.
+            // Vérification supplémentaire : on ne valide l'adresse que si elle
+            // est alignée sur 2 octets ET si la valeur reste stable à 0 après écriture.
+            constexpr uintptr_t SCAN_RANGE = 0x800;
+
             uintptr_t searchBases[4] = {0};
             int baseCount = 0;
 
@@ -820,18 +1006,26 @@ void PlayerSync::EnableSummoning() {
 
             for (int b = 0; b < baseCount && s_teamTypeAddr == 0; b++) {
                 uintptr_t base = searchBases[b];
-                for (uintptr_t offset = 0; offset < 0x10000; offset += 2) {
+                for (uintptr_t offset = 0; offset < SCAN_RANGE; offset += 2) {
                     uint16_t val = 0;
-                    if (Memory::Read<uint16_t>(base + offset, &val) && val == 513) {
-                        Memory::Write<uint16_t>(base + offset, (uint16_t)0);
-                        uint16_t check = 0;
-                        Memory::Read<uint16_t>(base + offset, &check);
-                        if (check == 0) {
-                            s_teamTypeAddr = base + offset;
-                            LOG_INFO("TeamType FOUND at 0x%llX (base+0x%llX), set to 0", s_teamTypeAddr, offset);
-                            break;
-                        }
+                    if (!Memory::Read<uint16_t>(base + offset, &val) || val != 513)
+                        continue;
+
+                    // Écrire 0, relire — si une autre valeur revient immédiatement
+                    // c'est un faux positif (champ vivant écrit en permanence par le jeu)
+                    Memory::Write<uint16_t>(base + offset, (uint16_t)0);
+                    uint16_t check = 0;
+                    Memory::Read<uint16_t>(base + offset, &check);
+                    if (check != 0) {
+                        // Le jeu a réécrit la valeur immédiatement — mauvaise adresse
+                        LOG_DEBUG("TeamType: false positive at base+0x%llX (val restored to %u)", offset, check);
+                        continue;
                     }
+
+                    s_teamTypeAddr = base + offset;
+                    LOG_INFO("TeamType FOUND at 0x%llX (base+0x%llX), set to 0",
+                             s_teamTypeAddr, offset);
+                    break;
                 }
             }
         } __except(EXCEPTION_EXECUTE_HANDLER) {}
@@ -915,4 +1109,102 @@ void PlayerSync::EnableSummoning() {
 
 std::string PlayerSync::GetLocalCharacterName() {
     return ReadCharacterName();
+}
+
+// ============================================================================
+// TeleportToHost
+//
+// Writes the host's last-known position directly into the local player's
+// PlayerData position fields (X/Y/Z at +0x30/+0x34/+0x38).
+//
+// This is a "soft teleport" — the game physics engine will accept the new
+// coordinates on the next frame. Works within the same area; if the host is
+// in a different zone, the player should use the zone-sync / bonfire warp
+// instead. We add +1.0 on Y to avoid embedding the player in the ground.
+//
+// Built-in cooldown: 10 seconds between uses to prevent spam-clicking.
+// ============================================================================
+bool PlayerSync::TeleportToHost() {
+    // ── Cooldown ─────────────────────────────────────────────────────────────
+    static DWORD s_lastTeleportMs = 0;
+    constexpr DWORD COOLDOWN_MS = 10000; // 10 seconds
+    DWORD now = GetTickCount();
+    if (now - s_lastTeleportMs < COOLDOWN_MS) {
+        DWORD remaining = (COOLDOWN_MS - (now - s_lastTeleportMs)) / 1000 + 1;
+        LOG_INFO("[TP] Emergency teleport on cooldown (%us remaining)", remaining);
+        DS2Coop::UI::Overlay::GetInstance().ShowNotification(
+            std::string("Téléportation : patientez encore ")
+            + std::to_string(remaining) + "s.", 2.5f);
+        return false;
+    }
+
+    // ── Find host in session ──────────────────────────────────────────────────
+    auto& sessionMgr = DS2Coop::Session::SessionManager::GetInstance();
+    if (!sessionMgr.IsActive()) {
+        LOG_WARNING("[TP] TeleportToHost: no active session");
+        return false;
+    }
+
+    auto players = sessionMgr.GetPlayers();
+    uint64_t localId = Network::PeerManager::GetInstance().GetLocalPlayerId();
+
+    // Find the host: the first player that is not us, or the one marked as host.
+    // SessionManager stores players in join order — host is at index 0 if present.
+    const DS2Coop::Session::SessionPlayer* hostPlayer = nullptr;
+    for (const auto& p : players) {
+        if (p.playerId != localId && p.playerId != 0) {
+            hostPlayer = &p;
+            break;
+        }
+    }
+
+    if (!hostPlayer) {
+        LOG_WARNING("[TP] TeleportToHost: host not found in player list");
+        DS2Coop::UI::Overlay::GetInstance().ShowNotification(
+            "Téléportation impossible : hôte introuvable.", 4.0f);
+        return false;
+    }
+
+    float tx = hostPlayer->x;
+    float ty = hostPlayer->y;
+    float tz = hostPlayer->z;
+
+    // Reject if host position is uninitialized (all zeros = not received yet)
+    if (tx == 0.0f && ty == 0.0f && tz == 0.0f) {
+        LOG_WARNING("[TP] TeleportToHost: host position not yet received");
+        DS2Coop::UI::Overlay::GetInstance().ShowNotification(
+            "Position de l'hôte inconnue — réessayez dans quelques secondes.", 4.0f);
+        return false;
+    }
+
+    // ── Write position to local PlayerData ───────────────────────────────────
+    uintptr_t playerData = 0;
+    if (!ReadPlayerDataBase(playerData)) {
+        LOG_WARNING("[TP] TeleportToHost: PlayerData not readable");
+        DS2Coop::UI::Overlay::GetInstance().ShowNotification(
+            "Téléportation impossible : données joueur non accessibles.", 4.0f);
+        return false;
+    }
+
+    // Slight Y offset so we land on top of the host rather than inside them
+    float writeY = ty + 1.2f;
+
+    bool ok = true;
+    ok &= Memory::Write<float>(playerData + Offsets::GameManager::PositionX, tx);
+    ok &= Memory::Write<float>(playerData + Offsets::GameManager::PositionY, writeY);
+    ok &= Memory::Write<float>(playerData + Offsets::GameManager::PositionZ, tz);
+
+    if (ok) {
+        s_lastTeleportMs = now;
+        LOG_INFO("[TP] Teleported to host '%s' at (%.1f, %.1f, %.1f)",
+                 hostPlayer->playerName.c_str(), tx, writeY, tz);
+        DS2Coop::UI::Overlay::GetInstance().ShowNotification(
+            std::string("Téléporté sur ") + hostPlayer->playerName + " !", 3.0f);
+        return true;
+    } else {
+        LOG_ERROR("[TP] TeleportToHost: position write failed (pd=0x%llX)", playerData);
+        DS2Coop::UI::Overlay::GetInstance().ShowNotification(
+            "Téléportation échouée — écriture mémoire refusée.", 4.0f);
+        return false;
+    }
 }

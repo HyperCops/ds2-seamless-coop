@@ -16,6 +16,10 @@ PacketHandler& PacketHandler::GetInstance() {
     return instance;
 }
 
+// Externals from player_sync.cpp — flag our own ItemGive calls to avoid
+// the ItemGiveHook re-broadcasting items we're granting to ourselves.
+extern bool g_ourItemGiveCall;
+
 void PacketHandler::HandlePacket(const PacketHeader* packet, const PeerInfo& sender) {
     if (!packet) return;
 
@@ -72,12 +76,59 @@ void PacketHandler::HandlePacket(const PacketHeader* packet, const PeerInfo& sen
                 HandleEventFlag(reinterpret_cast<const EventFlagPacket*>(packet));
             break;
 
+        case PacketType::SoulsGranted:
+            if (packet->size >= sizeof(SoulsGrantedPacket)) {
+                const auto* sp = reinterpret_cast<const SoulsGrantedPacket*>(packet);
+                LOG_INFO("[SOULS] Received %u souls from %s — applying",
+                         sp->souls, sender.playerName.c_str());
+                DS2Coop::Sync::ProgressSync::ApplySoulsGainToMemory(sp->souls);
+            }
+            break;
+
+        case PacketType::ItemPickup:
+            if (packet->size >= sizeof(ItemPickupPacket)) {
+                const auto* ip = reinterpret_cast<const ItemPickupPacket*>(packet);
+                LOG_INFO("[ITEM] Received item 0x%08X (cat=%d qty=%d) from %s — giving to local player",
+                         ip->itemId, ip->category, ip->quantity, sender.playerName.c_str());
+                // Mark as mod call so ItemGiveHook doesn't re-broadcast it
+                g_ourItemGiveCall = true;
+                DS2Coop::Sync::ProgressSync::ApplyItemPickupToInventory(
+                    ip->category, ip->itemId, ip->durability,
+                    ip->quantity, ip->upgrade, ip->infusion);
+                g_ourItemGiveCall = false;
+            }
+            break;
+
+        case PacketType::ZoneTransition:
+            if (packet->size >= sizeof(ZoneTransitionPacket)) {
+                const auto* zp = reinterpret_cast<const ZoneTransitionPacket*>(packet);
+                // transitionType 1 = death respawn — don't sync, each player dies independently
+                if (zp->transitionType != 1) {
+                    const char* bonfireName =
+                        DS2Coop::Sync::ProgressSync::GetBonfireName(zp->bonfireId);
+                    LOG_INFO("[ZONE] %s warped to '%s' (bonfire %u) — executing local warp",
+                             sender.playerName.c_str(), bonfireName, zp->bonfireId);
+                    DS2Coop::Sync::ProgressSync::ExecuteBonfireWarp(zp->bonfireId);
+                } else {
+                    LOG_DEBUG("[ZONE] %s respawned (death) — not syncing",
+                              sender.playerName.c_str());
+                }
+            }
+            break;
+
         case PacketType::BonfireRest:
-            LOG_INFO("Remote player rested at bonfire");
+            if (packet->size >= sizeof(EventFlagPacket)) {
+                const auto* ep = reinterpret_cast<const EventFlagPacket*>(packet);
+                LOG_INFO("[BONFIRE] Remote player lit bonfire %u — applying flag", ep->flagId);
+                // Sync the event flag so the bonfire appears lit on next area load
+                DS2Coop::Sync::ProgressSync::ApplyEventFlagToMemory(ep->flagId, true);
+            } else {
+                LOG_INFO("[BONFIRE] Remote player rested at bonfire");
+            }
             break;
 
         case PacketType::FogGateTransition:
-            LOG_INFO("Remote player entered fog gate");
+            LOG_INFO("[FOG] Remote player entered fog gate");
             break;
 
         default:
@@ -97,19 +148,23 @@ void PacketHandler::HandleHandshake(const HandshakePacket* packet, const PeerInf
     sessionMgr.AddPlayer(packet->playerId, packet->playerName);
 }
 
-// Track last sequence per player to discard out-of-order UDP packets
-static std::unordered_map<uint64_t, uint32_t> g_lastPosSequence;
+void PacketHandler::RemovePlayer(uint64_t playerId) {
+    std::lock_guard<std::mutex> lock(m_seqMutex);
+    m_lastPosSequence.erase(playerId);
+}
 
 void PacketHandler::HandlePlayerPosition(const PlayerPositionPacket* packet) {
     if (!packet) return;
 
     // Drop out-of-order packets (handles uint32 wrap-around)
-    uint32_t& lastSeq = g_lastPosSequence[packet->playerId];
-    int32_t seqDiff = static_cast<int32_t>(packet->header.sequence - lastSeq);
-    if (seqDiff < 0 && seqDiff > -1000) {
-        return; // old packet, discard
+    {
+        std::lock_guard<std::mutex> lock(m_seqMutex);
+        uint32_t& lastSeq = m_lastPosSequence[packet->playerId];
+        int32_t seqDiff = static_cast<int32_t>(packet->header.sequence - lastSeq);
+        if (seqDiff < 0 && seqDiff > -1000)
+            return; // old packet, discard
+        lastSeq = packet->header.sequence;
     }
-    lastSeq = packet->header.sequence;
 
     auto& sessionMgr = DS2Coop::Session::SessionManager::GetInstance();
     sessionMgr.UpdatePlayerPosition(packet->playerId, packet->x, packet->y, packet->z);
@@ -138,10 +193,13 @@ void PacketHandler::HandlePlayerState(const PlayerStatePacket* packet) {
 void PacketHandler::HandleBossDefeated(const BossDefeatedPacket* packet) {
     if (!packet) return;
 
-    LOG_INFO("Boss %u was defeated by remote player", packet->bossId);
+    LOG_INFO("[BOSS] Remote peer killed boss (event flag %u) — applying to local memory",
+             packet->bossId);
 
+    // broadcastToNetwork=false: we received this from a peer, so we only write
+    // the flag to our own game memory.  No re-broadcast to avoid round-trips.
     auto& progressSync = DS2Coop::Sync::ProgressSync::GetInstance();
-    progressSync.SyncBossDefeat(packet->bossId);
+    progressSync.SyncBossDefeat(packet->bossId, false);
 }
 
 void PacketHandler::HandleEventFlag(const EventFlagPacket* packet) {

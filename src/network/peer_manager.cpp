@@ -20,13 +20,15 @@
 #include "../../include/hooks.h"
 #include "../../include/ui.h"
 #include "../../include/utils.h"
+#include "../../include/crypto.h"
 #include <chrono>
 #include <algorithm>
 
 using namespace DS2Coop::Network;
 using namespace DS2Coop::Utils;
 
-constexpr uint32_t PACKET_MAGIC = 0x44533243; // 'DS2C'
+constexpr uint32_t PACKET_MAGIC           = 0x44533243; // 'DS2C' — paquet en clair
+constexpr uint32_t PACKET_MAGIC_ENCRYPTED = 0x44533245; // 'DS2E' — paquet chiffré AES-256-GCM
 constexpr uint64_t HEARTBEAT_INTERVAL_MS = 5000;
 constexpr uint64_t TIMEOUT_DURATION_MS = 60000; // 60s — peers on Hamachi can have bursty latency
 
@@ -115,6 +117,11 @@ bool PeerManager::CreateSession(const std::string& password) {
     m_connected = true;
     m_sessionPassword = password;
 
+    // Dériver la clé de chiffrement depuis le mot de passe
+    if (!DS2Coop::Crypto::DeriveKey(password)) {
+        LOG_WARNING("[CRYPTO] Key derivation failed — packets will be sent unencrypted");
+    }
+
     LOG_INFO("Session created, waiting for peers on port %u...", m_port);
     return true;
 }
@@ -173,6 +180,11 @@ bool PeerManager::JoinSession(const std::string& address, uint16_t port, const s
     m_handshakeConfirmed = false;
     m_connectingTimestampMs = NowMs();
 
+    // Dériver la clé de chiffrement (même mot de passe = même clé côté host et client)
+    if (!DS2Coop::Crypto::DeriveKey(password)) {
+        LOG_WARNING("[CRYPTO] Key derivation failed — packets will be sent unencrypted");
+    }
+
     LOG_INFO("Handshake sent, waiting for response...");
     return true;
 }
@@ -199,6 +211,8 @@ void PeerManager::LeaveSession() {
     m_connected = false;
     m_isHost = false;
     m_sessionPassword.clear();
+
+    DS2Coop::Crypto::ClearKey();
 
     LOG_INFO("Session left");
 }
@@ -232,6 +246,44 @@ void PeerManager::Update() {
     }
 }
 
+// ============================================================================
+// Chiffrement à l'envoi : copie le paquet, chiffre le payload, ajoute le tag GCM.
+// Format câble : [ PacketHeader (AAD) ][ GCM tag 16B ][ payload chiffré ]
+// Si la clé n'est pas prête, envoie en clair avec le magic normal.
+// ============================================================================
+static std::vector<uint8_t> BuildEncryptedBuffer(const PacketHeader* packet) {
+    const size_t headerSize  = sizeof(PacketHeader);
+    const size_t totalSize   = packet->size;
+    const size_t payloadSize = (totalSize > headerSize) ? (totalSize - headerSize) : 0;
+
+    // Buffer final : header + tag GCM + payload chiffré
+    std::vector<uint8_t> buf(headerSize + DS2Coop::Crypto::GCM_TAG_BYTES + payloadSize);
+
+    // Copier header (AAD) + payload
+    memcpy(buf.data(), packet, headerSize);
+    if (payloadSize > 0)
+        memcpy(buf.data() + headerSize + DS2Coop::Crypto::GCM_TAG_BYTES,
+               reinterpret_cast<const uint8_t*>(packet) + headerSize, payloadSize);
+
+    // Changer le magic pour signaler que ce paquet est chiffré
+    reinterpret_cast<PacketHeader*>(buf.data())->magic = PACKET_MAGIC_ENCRYPTED;
+
+    uint8_t tag[DS2Coop::Crypto::GCM_TAG_BYTES] = {};
+    uint8_t* payload = buf.data() + headerSize + DS2Coop::Crypto::GCM_TAG_BYTES;
+
+    if (payloadSize > 0) {
+        DS2Coop::Crypto::Encrypt(
+            buf.data(), headerSize,   // AAD = header
+            payload, payloadSize,     // payload chiffré sur place
+            packet->sequence,
+            tag
+        );
+    }
+
+    memcpy(buf.data() + headerSize, tag, DS2Coop::Crypto::GCM_TAG_BYTES);
+    return buf;
+}
+
 bool PeerManager::SendPacket(const PacketHeader* packet, uint64_t targetPlayerId) {
     if (!m_initialized || !m_connected || !packet) return false;
 
@@ -245,8 +297,15 @@ bool PeerManager::SendPacket(const PacketHeader* packet, uint64_t targetPlayerId
             peerAddr.sin_addr.s_addr = peer.address;
             peerAddr.sin_port = htons(peer.port);
 
-            sendto(sock, reinterpret_cast<const char*>(packet), packet->size, 0,
-                   reinterpret_cast<sockaddr*>(&peerAddr), sizeof(peerAddr));
+            if (DS2Coop::Crypto::IsKeyReady()) {
+                auto buf = BuildEncryptedBuffer(packet);
+                sendto(sock, reinterpret_cast<const char*>(buf.data()),
+                       static_cast<int>(buf.size()), 0,
+                       reinterpret_cast<sockaddr*>(&peerAddr), sizeof(peerAddr));
+            } else {
+                sendto(sock, reinterpret_cast<const char*>(packet), packet->size, 0,
+                       reinterpret_cast<sockaddr*>(&peerAddr), sizeof(peerAddr));
+            }
 
             if (targetPlayerId != 0) return true;
         }
@@ -261,13 +320,24 @@ void PeerManager::BroadcastPacket(const PacketHeader* packet) {
     std::lock_guard<std::recursive_mutex> lock(m_peersMutex);
     SOCKET sock = reinterpret_cast<SOCKET>(m_socket);
 
-    for (const auto& peer : m_peers) {
-        if (peer.connected) {
-            sockaddr_in peerAddr{};
-            peerAddr.sin_family = AF_INET;
-            peerAddr.sin_addr.s_addr = peer.address;
-            peerAddr.sin_port = htons(peer.port);
+    // Construire le buffer chiffré une seule fois pour tous les peers
+    std::vector<uint8_t> encBuf;
+    if (DS2Coop::Crypto::IsKeyReady())
+        encBuf = BuildEncryptedBuffer(packet);
 
+    for (const auto& peer : m_peers) {
+        if (!peer.connected) continue;
+
+        sockaddr_in peerAddr{};
+        peerAddr.sin_family = AF_INET;
+        peerAddr.sin_addr.s_addr = peer.address;
+        peerAddr.sin_port = htons(peer.port);
+
+        if (!encBuf.empty()) {
+            sendto(sock, reinterpret_cast<const char*>(encBuf.data()),
+                   static_cast<int>(encBuf.size()), 0,
+                   reinterpret_cast<sockaddr*>(&peerAddr), sizeof(peerAddr));
+        } else {
             sendto(sock, reinterpret_cast<const char*>(packet), packet->size, 0,
                    reinterpret_cast<sockaddr*>(&peerAddr), sizeof(peerAddr));
         }
@@ -305,9 +375,35 @@ void PeerManager::HandleIncomingPackets() {
 
         if (pkt.size >= static_cast<int>(sizeof(PacketHeader))) {
             PacketHeader* hdr = reinterpret_cast<PacketHeader*>(pkt.data);
-            if (hdr->magic == PACKET_MAGIC) {
+
+            if (hdr->magic == PACKET_MAGIC_ENCRYPTED) {
+                // Paquet chiffré : décrypter le payload sur place
+                const size_t headerSize  = sizeof(PacketHeader);
+                const size_t minSize     = static_cast<int>(headerSize + DS2Coop::Crypto::GCM_TAG_BYTES);
+                if (pkt.size < static_cast<int>(minSize)) continue; // trop court
+
+                uint8_t* raw       = reinterpret_cast<uint8_t*>(pkt.data);
+                const uint8_t* tag = raw + headerSize;
+                uint8_t* payload   = raw + headerSize + DS2Coop::Crypto::GCM_TAG_BYTES;
+                size_t payloadSize = pkt.size - minSize;
+
+                if (!DS2Coop::Crypto::Decrypt(raw, headerSize, payload, payloadSize,
+                                               hdr->sequence, tag)) {
+                    LOG_WARNING("[CRYPTO] Dropped packet with invalid GCM tag from %s:%u",
+                        inet_ntoa(pkt.sender.sin_addr), ntohs(pkt.sender.sin_port));
+                    continue; // rejeté — tag invalide ou paquet falsifié
+                }
+
+                // Remettre le magic normal et décaler le payload pour supprimer le tag
+                hdr->magic = PACKET_MAGIC;
+                memmove(raw + headerSize, payload, payloadSize);
+                pkt.size = static_cast<int>(headerSize + payloadSize);
+
+                packets.push_back(pkt);
+            } else if (hdr->magic == PACKET_MAGIC) {
                 packets.push_back(pkt);
             }
+            // Paquets avec magic inconnu sont silencieusement ignorés
         }
     }
 
@@ -370,7 +466,6 @@ void PeerManager::HandleHandshakePacket(const HandshakePacket* hs, const sockadd
 
         if (m_sessionPassword != justPassword) {
             LOG_WARNING("Peer rejected: wrong password");
-            // Send rejection (a disconnect packet)
             PacketHeader reject{};
             reject.magic = PACKET_MAGIC;
             reject.type = PacketType::Disconnect;
@@ -383,38 +478,47 @@ void PeerManager::HandleHandshakePacket(const HandshakePacket* hs, const sockadd
             return;
         }
 
-        // Password matches - register peer
+        // Password matches - register peer (sous lock car m_peers est lu depuis d'autres threads)
         bool alreadyKnown = false;
-        for (auto& peer : m_peers) {
-            if (peer.playerId == hs->playerId) {
-                peer.lastHeartbeat = NowMs();
-                peer.connected = true;
-                alreadyKnown = true;
-                break;
+        bool newPeerAdded = false;
+        std::string extractedSteamId;
+        {
+            std::lock_guard<std::recursive_mutex> lock(m_peersMutex);
+            for (auto& peer : m_peers) {
+                if (peer.playerId == hs->playerId) {
+                    peer.lastHeartbeat = NowMs();
+                    peer.connected = true;
+                    alreadyKnown = true;
+                    break;
+                }
+            }
+
+            if (!alreadyKnown) {
+                PeerInfo newPeer{};
+                newPeer.playerId = hs->playerId;
+                newPeer.playerName = hs->playerName;
+                newPeer.address = senderAddr.sin_addr.s_addr;
+                newPeer.port = ntohs(senderAddr.sin_port);
+                newPeer.lastHeartbeat = NowMs();
+                newPeer.connected = true;
+                m_peers.push_back(newPeer);
+                newPeerAdded = true;
+
+                // Extract Steam ID hors du lock (string operations)
+                std::string pw(hs->password);
+                size_t pipe = pw.find('|');
+                if (pipe != std::string::npos && pipe + 1 < pw.size())
+                    extractedSteamId = pw.substr(pipe + 1);
             }
         }
 
-        if (!alreadyKnown) {
-            PeerInfo newPeer{};
-            newPeer.playerId = hs->playerId;
-            newPeer.playerName = hs->playerName;
-            newPeer.address = senderAddr.sin_addr.s_addr;
-            newPeer.port = ntohs(senderAddr.sin_port);
-            newPeer.lastHeartbeat = NowMs();
-            newPeer.connected = true;
-            m_peers.push_back(newPeer);
-
+        if (newPeerAdded) {
             LOG_INFO("Peer accepted: %s (ID: %llu) from port %u",
-                     hs->playerName, hs->playerId, newPeer.port);
+                     hs->playerName, hs->playerId, ntohs(senderAddr.sin_port));
 
-            // Extract peer's Steam ID from password field ("password|steamid")
-            std::string pw(hs->password);
-            size_t pipe = pw.find('|');
-            if (pipe != std::string::npos && pipe + 1 < pw.size()) {
-                DS2Coop::Hooks::ProtobufHooks::AddSessionSteamId(pw.substr(pipe + 1));
-            }
+            if (!extractedSteamId.empty())
+                DS2Coop::Hooks::ProtobufHooks::AddSessionSteamId(extractedSteamId);
 
-            // First real peer connected — activate seamless disconnect blocking now
             DS2Coop::Hooks::ProtobufHooks::SetSeamlessActive(true);
             LOG_INFO("[SEAMLESS] First peer connected — seamless mode ON");
         }
@@ -441,25 +545,25 @@ void PeerManager::HandleHandshakePacket(const HandshakePacket* hs, const sockadd
         // Client: this is the host's response to our handshake
         LOG_INFO("Received handshake response from host (ID: %llu)", hs->playerId);
 
-        // Update the host peer entry with the real player ID
-        for (auto& peer : m_peers) {
-            if (peer.address == senderAddr.sin_addr.s_addr) {
-                peer.playerId = hs->playerId;
-                peer.playerName = hs->playerName;
-                peer.lastHeartbeat = NowMs();
-                peer.connected = true;
-                break;
+        {
+            std::lock_guard<std::recursive_mutex> lock(m_peersMutex);
+            for (auto& peer : m_peers) {
+                if (peer.address == senderAddr.sin_addr.s_addr) {
+                    peer.playerId = hs->playerId;
+                    peer.playerName = hs->playerName;
+                    peer.lastHeartbeat = NowMs();
+                    peer.connected = true;
+                    break;
+                }
             }
         }
 
         m_handshakeConfirmed = true;
         LOG_INFO("Connected to host: %s", hs->playerName);
 
-        // Handshake confirmed — activate seamless disconnect blocking now
         DS2Coop::Hooks::ProtobufHooks::SetSeamlessActive(true);
         LOG_INFO("[SEAMLESS] Handshake confirmed — seamless mode ON");
 
-        // Show connection notification
         DS2Coop::UI::Overlay::GetInstance().ShowNotification("Connected to host! Seamless co-op active.", 5.0f);
     }
 

@@ -9,12 +9,45 @@
 #include "../../include/ui.h"
 #include "../../include/utils.h"
 #include <algorithm>
+#include <fstream>
 #include <mmsystem.h>
 #pragma comment(lib, "winmm.lib")
 #include <chrono>
 
 using namespace DS2Coop::Session;
 using namespace DS2Coop::Utils;
+
+// ============================================================================
+// Persistance de la dernière session pour le bouton "Rejoindre"
+// ============================================================================
+static const char* LAST_SESSION_FILE = "ds2_last_session.ini";
+
+static void SaveLastSession(const std::string& ip, const std::string& password) {
+    std::ofstream f(LAST_SESSION_FILE);
+    if (f.is_open()) {
+        f << "ip=" << ip << "\n";
+        f << "password=" << password << "\n";
+    }
+}
+
+static void ClearLastSession() {
+    std::remove(LAST_SESSION_FILE);
+}
+
+static bool LoadLastSession(std::string& outIp, std::string& outPassword) {
+    std::ifstream f(LAST_SESSION_FILE);
+    if (!f.is_open()) return false;
+    std::string line;
+    while (std::getline(f, line)) {
+        size_t eq = line.find('=');
+        if (eq == std::string::npos) continue;
+        std::string key = line.substr(0, eq);
+        std::string val = line.substr(eq + 1);
+        if (key == "ip")       outIp       = val;
+        if (key == "password") outPassword = val;
+    }
+    return !outIp.empty() && !outPassword.empty();
+}
 
 SessionManager& SessionManager::GetInstance() {
     static SessionManager instance;
@@ -97,6 +130,9 @@ bool SessionManager::CreateSession(const std::string& password) {
         Hooks::ProtobufHooks::AddSessionSteamId(localSteam);
     }
 
+    // Reset boss-kill deduplication so flags can be re-broadcast if peers join later
+    Hooks::GameState::ClearBroadcastFlagCache();
+
     LOG_INFO("Session created. Local player ID: %llu", m_localPlayerId);
     return true;
 }
@@ -161,6 +197,12 @@ bool SessionManager::JoinSession(const std::string& address, const std::string& 
         Hooks::ProtobufHooks::AddSessionSteamId(localSteam);
     }
 
+    // Sauvegarder pour le bouton "Rejoindre dernière session"
+    SaveLastSession(address, password);
+
+    // Reset boss-kill deduplication
+    Hooks::GameState::ClearBroadcastFlagCache();
+
     LOG_INFO("Joined session. Local player ID: %llu", m_localPlayerId);
     return true;
 }
@@ -169,6 +211,12 @@ void SessionManager::LeaveSession() {
     if (m_state == SessionState::Disconnected) return;
 
     LOG_INFO("Leaving session...");
+
+    // Effacer la sauvegarde de dernière session à la déconnexion volontaire
+    ClearLastSession();
+
+    // Reset boss-kill deduplication so the next session starts clean
+    Hooks::GameState::ClearBroadcastFlagCache();
 
     // Leave network session
     auto& peerMgr = Network::PeerManager::GetInstance();
@@ -251,6 +299,9 @@ void SessionManager::RemovePlayer(uint64_t playerId) {
         m_players.end()
     );
 
+    // Nettoyer l'état de séquence UDP du joueur
+    Network::PacketHandler::GetInstance().RemovePlayer(playerId);
+
     LOG_INFO("Player left session: %s (ID: %llu) [Total: %zu players]",
              name.c_str(), playerId, m_players.size());
 
@@ -259,12 +310,29 @@ void SessionManager::RemovePlayer(uint64_t playerId) {
         PlaySoundW(L"SystemExclamation", nullptr, SND_ALIAS | SND_ASYNC);
     }
 
-    // If we're now alone (only local player remains), seamless blocking is no longer
-    // needed — re-enable it on the next connect. Keep it active for now so any
-    // in-flight messages from the departing player don't crash us, but show a notice.
+    // Si on se retrouve seul, programmer la désactivation du seamless mode dans un thread
+    // séparé avec un délai de 5s pour laisser passer les messages in-flight du joueur sortant.
     if (m_players.size() <= 1) {
-        LOG_INFO("All remote players gone — session effectively solo");
+        LOG_INFO("All remote players gone — scheduling seamless mode deactivation in 5s");
         UI::Overlay::GetInstance().ShowNotification("Session empty. Waiting for players...", 5.0f);
+
+        CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
+            Sleep(5000);
+            // Vérifier qu'on est toujours seul avant de désactiver
+            auto& sm = DS2Coop::Session::SessionManager::GetInstance();
+            auto players = sm.GetPlayers();
+            auto* local = sm.GetLocalPlayer();
+            uint64_t localId = local ? local->playerId : 0;
+            bool stillAlone = true;
+            for (const auto& p : players) {
+                if (p.playerId != localId) { stillAlone = false; break; }
+            }
+            if (stillAlone) {
+                DS2Coop::Hooks::ProtobufHooks::SetSeamlessActive(false);
+                LOG_INFO("Seamless mode DEACTIVATED — session is empty");
+            }
+            return 0;
+        }, nullptr, 0, nullptr);
     }
 }
 
@@ -411,4 +479,8 @@ void SessionManager::TransitionToState(SessionState newState) {
 
 void SessionManager::SynchronizePlayers() {
     // Driven by PlayerSync::Update now
+}
+
+bool SessionManager::GetLastSession(std::string& outIp, std::string& outPassword) {
+    return LoadLastSession(outIp, outPassword);
 }

@@ -1,49 +1,32 @@
-# Build
+# Build output
 build/
+dist/
+out/
 
-# Binaries
-*.dll
-*.exe
+# Visual Studio
+.vs/
+*.user
+*.suo
+CMakeSettings.json
+cmake-build-*/
+
+# Compiled objects
 *.obj
 *.pdb
 *.ilk
 *.exp
 *.lib
+*.idb
 
-# IDE
-.vs/
-.vscode/
-*.suo
-*.user
+# Python cache
+__pycache__/
+*.pyc
 
 # OS
 Thumbs.db
-nul
+.DS_Store
+desktop.ini
 
 # Logs
 *.log
-
-# Dist/Release binaries (source only in git)
-dist/*.exe
-dist/*.dll
-Release/*.exe
-Release/*.dll
-
-.claude/
-*.zip
-third_party/ds3os
-
-# Secrets — NEVER commit private keys
-private.key
-*.pem
-
-# Server runtime data
-*.sqlite
-*.time
-server/Saved/default/private.key
-server/Saved/default/database.sqlite
-server/Saved/default/last_activity.time
-Release/Server/Saved/default/private.key
-Release/Server/Saved/default/database.sqlite
-Release/Server/Saved/default/last_activity.time
-third_party/ds3os/build/
+logs/

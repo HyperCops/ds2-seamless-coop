@@ -53,6 +53,7 @@ private:
     void RenderJoinMenu();
     void RenderPlayerList();
     void RenderNotifications();
+    void RenderPlayerHUD();     // Always-on 2D party HUD (names + HP bars, Yui-style)
 
     bool m_visible = false;
     bool m_initialized = false;
@@ -62,6 +63,11 @@ private:
 
     char m_inputIP[128]       = {0};
     char m_inputPassword[128] = {0};
+    char m_codeInput[256]     = {0};   // Join-by-code field
+
+    // Session codes generated when hosting starts (DS2-<base64> strings)
+    std::string m_activePublicCode;
+    std::string m_activeLANCode;
 
     struct Notification {
         std::string message;

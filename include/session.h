@@ -71,6 +71,9 @@ public:
     void PreventDisconnection();
     void AllowDisconnection();
 
+    // Dernière session connue (pour le bouton "Rejoindre")
+    static bool GetLastSession(std::string& outIp, std::string& outPassword);
+
 private:
     SessionManager() = default;
     ~SessionManager() = default;

@@ -132,7 +132,18 @@ void WinsockHooks::UninstallHooks() {
 // DS2's hostname is NOT encrypted (unlike DS3), so we can patch directly.
 // ============================================================================
 
-// Search game memory for a wide string
+// Vérifie si une page mémoire est lisible (ni guard, ni no-access)
+static bool IsPageReadable(uintptr_t addr) {
+    MEMORY_BASIC_INFORMATION mbi{};
+    if (VirtualQuery(reinterpret_cast<void*>(addr), &mbi, sizeof(mbi)) == 0)
+        return false;
+    if (mbi.State != MEM_COMMIT)
+        return false;
+    constexpr DWORD badFlags = PAGE_NOACCESS | PAGE_GUARD;
+    return (mbi.Protect & badFlags) == 0;
+}
+
+// Recherche une chaîne wide dans la mémoire du module, en sautant les pages non-lisibles
 static std::vector<uintptr_t> SearchWideString(const wchar_t* needle) {
     std::vector<uintptr_t> results;
 
@@ -150,18 +161,27 @@ static std::vector<uintptr_t> SearchWideString(const wchar_t* needle) {
     size_t needleLen = wcslen(needle);
     size_t needleBytes = needleLen * sizeof(wchar_t);
 
-    if (needleBytes >= moduleSize) return results;
+    if (needleBytes == 0 || needleBytes >= moduleSize) return results;
 
-    for (size_t i = 0; i < moduleSize - needleBytes; i++) {
-        if (memcmp(reinterpret_cast<void*>(base + i), needle, needleBytes) == 0) {
-            results.push_back(base + i);
+    uintptr_t end = base + moduleSize - needleBytes;
+    uintptr_t i = base;
+    while (i <= end) {
+        // Sauter les pages non-lisibles par blocs (VirtualQuery couvre toute la région)
+        if (!IsPageReadable(i)) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (VirtualQuery(reinterpret_cast<void*>(i), &mbi, sizeof(mbi)) == 0) break;
+            i += mbi.RegionSize;
+            continue;
         }
+        if (memcmp(reinterpret_cast<void*>(i), needle, needleBytes) == 0)
+            results.push_back(i);
+        i++;
     }
 
     return results;
 }
 
-// Search game memory for an ASCII string
+// Recherche une chaîne ASCII dans la mémoire du module, en sautant les pages non-lisibles
 static std::vector<uintptr_t> SearchAsciiString(const char* needle) {
     std::vector<uintptr_t> results;
 
@@ -178,12 +198,20 @@ static std::vector<uintptr_t> SearchAsciiString(const char* needle) {
     size_t moduleSize = modInfo.SizeOfImage;
     size_t needleLen = strlen(needle);
 
-    if (needleLen >= moduleSize) return results;
+    if (needleLen == 0 || needleLen >= moduleSize) return results;
 
-    for (size_t i = 0; i < moduleSize - needleLen; i++) {
-        if (memcmp(reinterpret_cast<void*>(base + i), needle, needleLen) == 0) {
-            results.push_back(base + i);
+    uintptr_t end = base + moduleSize - needleLen;
+    uintptr_t i = base;
+    while (i <= end) {
+        if (!IsPageReadable(i)) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (VirtualQuery(reinterpret_cast<void*>(i), &mbi, sizeof(mbi)) == 0) break;
+            i += mbi.RegionSize;
+            continue;
         }
+        if (memcmp(reinterpret_cast<void*>(i), needle, needleLen) == 0)
+            results.push_back(i);
+        i++;
     }
 
     return results;

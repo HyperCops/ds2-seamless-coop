@@ -93,11 +93,11 @@ bool SeamlessCoopMod::Initialize() {
     // ================================================================
     // STEP 4: Install Winsock hooks + server redirect
     // ================================================================
-    LOG_INFO("[4/7] Installing Winsock hooks...");
+    LOG_INFO("[4/6] Installing Winsock hooks...");
     Hooks::WinsockHooks::InstallHooks();
 
     if (m_config.use_custom_server) {
-        LOG_INFO("[4/7] Setting up server redirect to %s:%u...",
+        LOG_INFO("[4/6] Setting up server redirect to %s:%u...",
                  m_config.server_ip.c_str(), m_config.server_port);
 
         // Configure the Winsock hook to redirect port 50031
@@ -113,8 +113,8 @@ bool SeamlessCoopMod::Initialize() {
                 testKey.open(keyPath);
             }
             if (!testKey.good()) {
-                LOG_WARNING("[4/7] No public key file found — RSA patching will be skipped");
-                LOG_WARNING("[4/7] Place ds2_server_public.key in game folder for server auth");
+                LOG_WARNING("[4/6] No public key file found — RSA patching will be skipped");
+                LOG_WARNING("[4/6] Place ds2_server_public.key in game folder for server auth");
                 // Still patch hostname in background thread (needs SteamStub wait)
                 std::string ip = m_config.server_ip;
                 CreateThread(nullptr, 0, [](LPVOID param) -> DWORD {
@@ -141,14 +141,22 @@ bool SeamlessCoopMod::Initialize() {
 
     // ================================================================
     // STEP 5: Install game state hooks (optional local event detection)
+    //
+    // PlayerSync::Initialize() MUST run first so that g_itemGiveFunc is
+    // resolved (AOB scan) before GameState::InstallHooks() tries to hook it.
+    // Without this, the ItemGive hook would be deferred until the first
+    // session join — missing all item pickups before that point.
     // ================================================================
-    LOG_INFO("[5/7] Installing game state hooks...");
+    LOG_INFO("[5/6] Pre-initializing PlayerSync (ItemGive AOB scan)...");
+    Sync::PlayerSync::GetInstance().Initialize();
+
+    LOG_INFO("[5/6] Installing game state hooks...");
     Hooks::GameState::InstallHooks();
 
     // ================================================================
     // STEP 6: Initialize subsystems
     // ================================================================
-    LOG_INFO("[6/7] Initializing subsystems...");
+    LOG_INFO("[6/6] Initializing subsystems...");
 
     // Network manager (our P2P layer)
     if (!Network::PeerManager::GetInstance().Initialize(m_config.port)) {
@@ -176,6 +184,11 @@ bool SeamlessCoopMod::Initialize() {
     // Title notifier
     UI::TitleScreenNotifier::GetInstance().Start();
 
+    // m_running doit être true AVANT de créer le thread pour éviter que la
+    // boucle while() ne lise false et sorte immédiatement au premier tick.
+    m_running = true;
+    m_initialized = true;
+
     // Start the main update loop in a background thread
     // This drives networking, sync, and session management
     m_updateThread = CreateThread(nullptr, 0, [](LPVOID param) -> DWORD {
@@ -184,7 +197,7 @@ bool SeamlessCoopMod::Initialize() {
 
         auto lastTime = std::chrono::steady_clock::now();
 
-        while (mod->IsInitialized()) {
+        while (mod->m_running.load()) {
             auto now = std::chrono::steady_clock::now();
             float deltaTime = std::chrono::duration<float>(now - lastTime).count();
             lastTime = now;
@@ -200,8 +213,6 @@ bool SeamlessCoopMod::Initialize() {
         LOG_INFO("Update thread exiting");
         return 0;
     }, this, 0, nullptr);
-
-    m_initialized = true;
 
     // Final status report
     LOG_INFO("==========================================");
@@ -232,6 +243,7 @@ void SeamlessCoopMod::Shutdown() {
 
     // Signal update thread to stop, then wait
     m_initialized = false;
+    m_running = false;
     if (m_updateThread) {
         WaitForSingleObject(m_updateThread, 3000);
         CloseHandle(m_updateThread);

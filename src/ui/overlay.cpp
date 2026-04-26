@@ -42,6 +42,87 @@ using namespace DS2Coop::Network;
 namespace DS2Coop::UI {
 
 // ============================================================================
+// Session code helpers
+//
+// A session code is: "DS2-" + Base64("IP:PORT:password")
+//
+// Example: "85.23.114.7:27015:coop" → DS2-ODUuMjMuMTE0Ljc6MjcwMTU6Y29vcA==
+//
+// Encoding this way means:
+//   • A single string the host pastes to their friend (Discord, chat, …)
+//   • The join menu auto-detects "DS2-" and decodes it automatically
+//   • No IP, no port, no separate password field for the guest
+// ============================================================================
+
+static const char kB64Chars[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static std::string Base64Encode(const std::string& in) {
+    std::string out;
+    int val = 0, valb = -6;
+    for (unsigned char c : in) {
+        val = (val << 8) + c;
+        valb += 8;
+        while (valb >= 0) {
+            out.push_back(kB64Chars[(val >> valb) & 0x3F]);
+            valb -= 6;
+        }
+    }
+    if (valb > -6)
+        out.push_back(kB64Chars[((val << 8) >> (valb + 8)) & 0x3F]);
+    while (out.size() % 4)
+        out.push_back('=');
+    return out;
+}
+
+static std::string Base64Decode(const std::string& in) {
+    int T[256];
+    memset(T, -1, sizeof(T));
+    for (int i = 0; i < 64; i++) T[(unsigned char)kB64Chars[i]] = i;
+    std::string out;
+    int val = 0, valb = -8;
+    for (unsigned char c : in) {
+        if (T[c] == -1) break;
+        val = (val << 6) + T[c];
+        valb += 6;
+        if (valb >= 0) {
+            out.push_back(static_cast<char>((val >> valb) & 0xFF));
+            valb -= 8;
+        }
+    }
+    return out;
+}
+
+// Builds a DS2-<base64> session code from IP, port and password.
+static std::string MakeSessionCode(const std::string& ip, uint16_t port, const std::string& password) {
+    if (ip.empty() || password.empty()) return "";
+    std::string raw = ip + ":" + std::to_string(port) + ":" + password;
+    return std::string("DS2-") + Base64Encode(raw);
+}
+
+// Returns true + fills ip/port/password if 'code' is a valid DS2- session code.
+static bool ParseSessionCode(const std::string& code,
+                             std::string& outIP, uint16_t& outPort,
+                             std::string& outPassword) {
+    if (code.size() < 5 || code.substr(0, 4) != "DS2-") return false;
+    std::string raw = Base64Decode(code.substr(4));
+    // raw = "IP:PORT:password"
+    size_t p1 = raw.find(':');
+    if (p1 == std::string::npos) return false;
+    size_t p2 = raw.find(':', p1 + 1);
+    if (p2 == std::string::npos) return false;
+
+    outIP       = raw.substr(0, p1);
+    std::string portStr = raw.substr(p1 + 1, p2 - p1 - 1);
+    outPassword = raw.substr(p2 + 1);
+
+    if (outIP.empty() || portStr.empty() || outPassword.empty()) return false;
+    try { outPort = static_cast<uint16_t>(std::stoi(portStr)); }
+    catch (...) { return false; }
+    return true;
+}
+
+// ============================================================================
 // Helper: copy text to clipboard
 // ============================================================================
 static void CopyToClipboard(const std::string& text) {
@@ -205,8 +286,9 @@ void Overlay::ShowNotification(const std::string& message, float duration) {
 // Main render — called every frame from HookedPresent
 // ============================================================================
 void Overlay::Render() {
-    // Always render notifications (even when menu is closed)
+    // Always render notifications and player HUD (even when menu is closed)
     RenderNotifications();
+    RenderPlayerHUD();
 
     if (!m_visible) return;
 
@@ -289,6 +371,32 @@ void Overlay::RenderMainMenu() {
         ImGui::Separator();
         ImGui::Spacing();
 
+        // Share session code (visible only if we are the host and have codes)
+        if (!m_activePublicCode.empty() || !m_activeLANCode.empty()) {
+            ImGui::TextDisabled("Share session code:");
+            ImGui::Separator();
+
+            if (!m_activePublicCode.empty()) {
+                ImGui::TextDisabled("  Internet:");
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Copy##scodepub")) {
+                    CopyToClipboard(m_activePublicCode);
+                    ShowNotification("Internet session code copied!", 2.5f);
+                }
+            }
+            if (!m_activeLANCode.empty()) {
+                ImGui::TextDisabled("  LAN/VPN: ");
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Copy##scodelan")) {
+                    CopyToClipboard(m_activeLANCode);
+                    ShowNotification("LAN session code copied!", 2.5f);
+                }
+            }
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+        }
+
         // Seamless tools
         ImGui::TextDisabled("Tools");
         ImGui::Separator();
@@ -302,12 +410,54 @@ void Overlay::RenderMainMenu() {
         }
 
         ImGui::Spacing();
+
+        // Emergency teleport — only useful for guests (grayed out if we are host)
+        bool isHost = DS2Coop::Network::PeerManager::GetInstance().IsHost();
+        if (isHost) {
+            ImGui::BeginDisabled(true);
+            ImGui::Button("⚡  TP sur l'hôte  (vous êtes l'hôte)", ImVec2(-1, 0));
+            ImGui::EndDisabled();
+        } else {
+            // Show cooldown in button label
+            static DWORD s_lastTpMs = 0;
+            constexpr DWORD TP_CD = 10000;
+            DWORD elapsed = GetTickCount() - s_lastTpMs;
+            bool onCooldown = (s_lastTpMs > 0 && elapsed < TP_CD);
+
+            char tpLabel[64];
+            if (onCooldown) {
+                DWORD secs = (TP_CD - elapsed) / 1000 + 1;
+                snprintf(tpLabel, sizeof(tpLabel), "⚡  TP sur l'hôte  (%us)", secs);
+            } else {
+                snprintf(tpLabel, sizeof(tpLabel), "⚡  TP sur l'hôte");
+            }
+
+            ImGui::BeginDisabled(onCooldown);
+            if (ImGui::Button(tpLabel, ImVec2(-1, 0))) {
+                if (DS2Coop::Sync::PlayerSync::GetInstance().TeleportToHost()) {
+                    s_lastTpMs = GetTickCount();
+                } else {
+                    // Notification already shown by TeleportToHost()
+                }
+            }
+            ImGui::EndDisabled();
+
+            if (!onCooldown) {
+                ImGui::TextDisabled("  Utiliser si bloqué ou déconnecté de l'hôte.");
+            }
+        }
+
+        ImGui::Spacing();
         ImGui::Separator();
         ImGui::Spacing();
 
         if (ImGui::Button("Leave Session", ImVec2(-1, 0))) {
             sessionMgr.LeaveSession();
             DS2Coop::Hooks::ProtobufHooks::SetSeamlessActive(false);
+            // Clear cached session codes so they don't appear next time
+            m_activePublicCode.clear();
+            m_activeLANCode.clear();
+            m_codeInput[0] = '\0';
             m_visible = false;
             ShowNotification("Left session.", 3.0f);
         }
@@ -330,6 +480,29 @@ void Overlay::RenderMainMenu() {
             m_inputPassword[0] = '\0';
             m_inputIP[0] = '\0';
         }
+
+        // Bouton "Rejoindre la dernière session" — affiché uniquement si une session a été sauvegardée
+        std::string lastIp, lastPw;
+        if (SessionManager::GetLastSession(lastIp, lastPw)) {
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+            ImGui::TextDisabled("Last session:");
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.80f, 0.65f, 0.20f, 1.0f));
+            ImGui::Text("  %s", lastIp.c_str());
+            ImGui::PopStyleColor();
+            ImGui::Spacing();
+
+            if (ImGui::Button("Rejoin Last Session", ImVec2(-1, 0))) {
+                auto& sessionMgr = SessionManager::GetInstance();
+                if (sessionMgr.JoinSession(lastIp, lastPw)) {
+                    ShowNotification("Reconnecting... waiting for host response.", 5.0f);
+                    m_currentState = MenuState::Main;
+                } else {
+                    ShowNotification("Reconnection failed. Host may be offline.", 4.0f);
+                }
+            }
+        }
     }
 
     ImGui::Spacing();
@@ -350,33 +523,76 @@ void Overlay::RenderHostMenu() {
         return;
     }
 
-    // Show IPs so they can share them
+    // Resolve IPs in the background (only once)
     static std::string cachedLocalIP;
     if (cachedLocalIP.empty()) cachedLocalIP = GetLocalIP();
     EnsurePublicIPFetched();
 
-    // IP addresses hidden by default (streamer safety)
-    static bool showIPs = false;
+    // ── Password field ──────────────────────────────────────────────────────
+    ImGui::TextDisabled("Session password (required):");
+    ImGui::SetNextItemWidth(-1);
+    ImGui::InputText("##password", m_inputPassword, sizeof(m_inputPassword));
+    ImGui::Spacing();
 
-    if (!showIPs) {
-        if (ImGui::Button("Show IP Addresses", ImVec2(-1, 0))) {
-            showIPs = true;
-        }
-        ImGui::TextDisabled("IPs hidden (click to reveal)");
+    bool hasPassword = strlen(m_inputPassword) > 0;
+    bool hasPublicIP = g_publicIPFetched && !g_publicIP.empty();
+
+    // ── Session codes (generated live once password + IP are available) ─────
+    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::TextDisabled("Share one of these codes with your friend:");
+    ImGui::TextDisabled("They paste it in Join > Session Code — done.");
+    ImGui::Spacing();
+
+    if (!hasPassword) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.6f, 0.6f, 1.0f));
+        ImGui::Text("  Enter a password above to generate codes.");
+        ImGui::PopStyleColor();
     } else {
-        if (ImGui::Button("Hide IP Addresses", ImVec2(-1, 0))) {
-            showIPs = false;
-        }
-
-        ImGui::TextDisabled("Share with friends:");
-
-        // Public IP
-        if (g_publicIPFetched && !g_publicIP.empty()) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.8f, 0.7f, 0.2f, 1.0f));
-            ImGui::Text("  Public:  %s : 27015", g_publicIP.c_str());
+        // Public code
+        if (!hasPublicIP) {
+            ImGui::TextDisabled("  Internet code: fetching IP...");
+        } else {
+            std::string pubCode = MakeSessionCode(g_publicIP, 27015, m_inputPassword);
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 0.9f, 0.4f, 1.0f));
+            ImGui::Text("  Internet:");
             ImGui::PopStyleColor();
             ImGui::SameLine();
-            if (ImGui::SmallButton("Copy##pub")) {
+            ImGui::TextDisabled("%s", pubCode.c_str());
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Copy##codepub")) {
+                CopyToClipboard(pubCode);
+                ShowNotification("Internet session code copied!", 2.5f);
+            }
+        }
+
+        // LAN code
+        std::string lanCode = MakeSessionCode(cachedLocalIP, 27015, m_inputPassword);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 0.7f, 1.0f, 1.0f));
+        ImGui::Text("  LAN/VPN: ");
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", lanCode.c_str());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Copy##codelan")) {
+            CopyToClipboard(lanCode);
+            ShowNotification("LAN session code copied!", 2.5f);
+        }
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // ── Advanced: raw IPs ──────────────────────────────────────────────────
+    static bool showIPs = false;
+    if (ImGui::SmallButton(showIPs ? "Hide raw IPs" : "Show raw IPs")) showIPs = !showIPs;
+    if (showIPs) {
+        ImGui::Spacing();
+        if (hasPublicIP) {
+            ImGui::TextDisabled("  Public:  %s:27015", g_publicIP.c_str());
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Copy##rawpub")) {
                 CopyToClipboard(g_publicIP);
                 ShowNotification("Public IP copied!", 2.0f);
             }
@@ -385,46 +601,28 @@ void Overlay::RenderHostMenu() {
         } else {
             ImGui::TextDisabled("  Public:  fetching...");
         }
-
-        // LAN / Hamachi IP
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.8f, 0.7f, 0.2f, 1.0f));
-        ImGui::Text("  LAN:     %s : 27015", cachedLocalIP.c_str());
-        ImGui::PopStyleColor();
+        ImGui::TextDisabled("  LAN:     %s:27015", cachedLocalIP.c_str());
         ImGui::SameLine();
-        if (ImGui::SmallButton("Copy##lan")) {
+        if (ImGui::SmallButton("Copy##rawlan")) {
             CopyToClipboard(cachedLocalIP);
             ShowNotification("LAN IP copied!", 2.0f);
         }
-    }
-
-    ImGui::Spacing();
-    ImGui::TextDisabled("Friends on the same network use LAN IP.");
-    ImGui::TextDisabled("Friends online need Public IP + port 27015 forwarded.");
-
-    ImGui::Spacing();
-    ImGui::Separator();
-    ImGui::Spacing();
-
-    ImGui::TextDisabled("Session password:");
-    ImGui::SetNextItemWidth(-1);
-    ImGui::InputText("##password", m_inputPassword, sizeof(m_inputPassword));
-
-    ImGui::Spacing();
-
-    // Validate
-    bool canHost = strlen(m_inputPassword) > 0;
-
-    if (!canHost) {
-        ImGui::TextDisabled("Enter a password to continue.");
         ImGui::Spacing();
     }
 
-    ImGui::BeginDisabled(!canHost);
+    ImGui::Spacing();
+
+    // ── Start / Back ───────────────────────────────────────────────────────
+    ImGui::BeginDisabled(!hasPassword);
     if (ImGui::Button("Start Hosting", ImVec2(-1, 0))) {
         auto& sessionMgr = SessionManager::GetInstance();
         if (sessionMgr.CreateSession(m_inputPassword)) {
-            // Seamless mode activates automatically when the first peer connects
-            ShowNotification(std::string("Hosting! Waiting for players..."), 6.0f);
+            // Cache codes for display in the active-session panel
+            if (hasPublicIP)
+                m_activePublicCode = MakeSessionCode(g_publicIP, 27015, m_inputPassword);
+            m_activeLANCode = MakeSessionCode(cachedLocalIP, 27015, m_inputPassword);
+
+            ShowNotification("Hosting!  Share the session code with friends.", 6.0f);
             m_currentState = MenuState::Main;
         } else {
             ShowNotification("Failed to create session. Check log.", 4.0f);
@@ -451,6 +649,60 @@ void Overlay::RenderJoinMenu() {
         return;
     }
 
+    // ── Mode 1 : Session Code (preferred) ──────────────────────────────────
+    ImGui::TextDisabled("Session Code:");
+    ImGui::TextDisabled("  (paste the DS2-... code the host sent you)");
+    ImGui::Spacing();
+    ImGui::SetNextItemWidth(-1);
+    bool codeChanged = ImGui::InputText("##code", m_codeInput, sizeof(m_codeInput),
+                                        ImGuiInputTextFlags_CharsNoBlank);
+    (void)codeChanged;
+
+    // Try to decode on the fly so we can give live feedback
+    std::string codeStr(m_codeInput);
+    bool isCode = !codeStr.empty() && codeStr.size() > 4 && codeStr.substr(0, 4) == "DS2-";
+    std::string decodedIP;
+    uint16_t    decodedPort = 27015;
+    std::string decodedPW;
+    bool codeValid = false;
+
+    if (isCode) {
+        codeValid = ParseSessionCode(codeStr, decodedIP, decodedPort, decodedPW);
+        if (codeValid) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 0.9f, 0.4f, 1.0f));
+            ImGui::Text("  Valid code: %s:%u", decodedIP.c_str(), decodedPort);
+            ImGui::PopStyleColor();
+        } else {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.9f, 0.3f, 0.3f, 1.0f));
+            ImGui::Text("  Invalid code — check for typos.");
+            ImGui::PopStyleColor();
+        }
+    } else if (!codeStr.empty()) {
+        ImGui::TextDisabled("  (not a DS2 session code — use manual fields below)");
+    }
+
+    ImGui::Spacing();
+
+    ImGui::BeginDisabled(!codeValid);
+    if (ImGui::Button("Connect with Code", ImVec2(-1, 0))) {
+        auto& sessionMgr = SessionManager::GetInstance();
+        if (sessionMgr.JoinSession(decodedIP, decodedPW)) {
+            ShowNotification("Connecting... waiting for host response.", 5.0f);
+            m_currentState = MenuState::Main;
+        } else {
+            ShowNotification("Connection failed. Check code or ask host to re-share.", 4.0f);
+        }
+    }
+    ImGui::EndDisabled();
+
+    // ── Separator ──────────────────────────────────────────────────────────
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+    ImGui::TextDisabled("— or enter manually —");
+    ImGui::Spacing();
+
+    // ── Mode 2 : Manual IP + password ──────────────────────────────────────
     ImGui::TextDisabled("Host's IP address:");
     ImGui::SetNextItemWidth(-1);
     ImGui::InputText("##ip", m_inputIP, sizeof(m_inputIP),
@@ -463,18 +715,17 @@ void Overlay::RenderJoinMenu() {
 
     ImGui::Spacing();
 
-    bool canJoin = strlen(m_inputIP) > 0 && strlen(m_inputPassword) > 0;
+    bool canJoinManual = strlen(m_inputIP) > 0 && strlen(m_inputPassword) > 0;
 
-    if (!canJoin) {
+    if (!canJoinManual) {
         ImGui::TextDisabled("Fill in IP and password to continue.");
         ImGui::Spacing();
     }
 
-    ImGui::BeginDisabled(!canJoin);
+    ImGui::BeginDisabled(!canJoinManual);
     if (ImGui::Button("Connect", ImVec2(-1, 0))) {
         auto& sessionMgr = SessionManager::GetInstance();
         if (sessionMgr.JoinSession(m_inputIP, m_inputPassword)) {
-            // Seamless mode activates automatically when host confirms the handshake
             ShowNotification("Connecting... waiting for host response.", 5.0f);
             m_currentState = MenuState::Main;
         } else {
@@ -496,6 +747,104 @@ void Overlay::RenderJoinMenu() {
 // ============================================================================
 void Overlay::RenderPlayerList() {
     m_currentState = MenuState::Main;
+}
+
+// ============================================================================
+// Player HUD — always-on party panel (Yui-style)
+//
+// Shown in the top-right corner whenever a co-op session is active,
+// regardless of whether the INSERT menu is open.
+//
+// Each entry shows:
+//   [██████████] Character Name  ← HP bar + name
+//   or
+//   [░░░░░░░░░░] Character Name  [MORT]  ← greyed out when dead
+//
+// The local player is highlighted in green, remote players in white.
+// ============================================================================
+void Overlay::RenderPlayerHUD() {
+    auto& sessionMgr = SessionManager::GetInstance();
+    if (!sessionMgr.IsActive()) return;
+
+    auto players = sessionMgr.GetPlayers();
+    if (players.empty()) return;
+
+    ImGuiIO& io = ImGui::GetIO();
+
+    // Anchor: top-right, small margin
+    const float panelW = 220.0f;
+    const float marginX = 12.0f, marginY = 12.0f;
+    ImGui::SetNextWindowPos(
+        ImVec2(io.DisplaySize.x - panelW - marginX, marginY),
+        ImGuiCond_Always, ImVec2(0.0f, 0.0f));
+    ImGui::SetNextWindowSize(ImVec2(panelW, 0), ImGuiCond_Always); // auto height
+    ImGui::SetNextWindowBgAlpha(0.55f);
+
+    ImGuiWindowFlags hudFlags =
+        ImGuiWindowFlags_NoDecoration   |
+        ImGuiWindowFlags_NoInputs        |
+        ImGuiWindowFlags_NoNav           |
+        ImGuiWindowFlags_NoMove          |
+        ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoBringToFrontOnFocus |
+        ImGuiWindowFlags_NoFocusOnAppearing    |
+        ImGuiWindowFlags_AlwaysAutoResize;
+
+    if (!ImGui::Begin("##playerhud", nullptr, hudFlags)) {
+        ImGui::End();
+        return;
+    }
+
+    uint64_t localId = PeerManager::GetInstance().GetLocalPlayerId();
+
+    for (const auto& p : players) {
+        bool isLocal = (p.playerId == 0 || p.playerId == localId);
+        bool isDead  = (!p.isAlive && p.maxHealth > 0);
+
+        // ── HP bar ──────────────────────────────────────────────────────────
+        float hpFrac = 1.0f;
+        if (p.maxHealth > 0) {
+            hpFrac = (float)p.health / (float)p.maxHealth;
+            if (hpFrac < 0.0f) hpFrac = 0.0f;
+            if (hpFrac > 1.0f) hpFrac = 1.0f;
+        }
+
+        ImVec4 barColor;
+        if (isDead) {
+            barColor = ImVec4(0.3f, 0.3f, 0.3f, 1.0f);
+        } else if (hpFrac > 0.6f) {
+            barColor = ImVec4(0.25f, 0.75f, 0.35f, 1.0f);  // green
+        } else if (hpFrac > 0.3f) {
+            barColor = ImVec4(0.85f, 0.65f, 0.10f, 1.0f);  // orange
+        } else {
+            barColor = ImVec4(0.85f, 0.20f, 0.15f, 1.0f);  // red
+        }
+
+        // Bar width = 60% of panel, label takes the rest
+        const float barWidth = panelW * 0.55f - 8.0f;
+
+        ImGui::PushStyleColor(ImGuiCol_PlotHistogram, barColor);
+        ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.12f, 0.12f, 0.12f, 0.85f));
+        ImGui::ProgressBar(isDead ? 0.0f : hpFrac, ImVec2(barWidth, 8.0f), "");
+        ImGui::PopStyleColor(2);
+
+        ImGui::SameLine(0, 6);
+
+        // ── Name ────────────────────────────────────────────────────────────
+        const std::string& name = p.playerName.empty() ? "(unnamed)" : p.playerName;
+
+        if (isDead) {
+            ImGui::TextColored(ImVec4(0.45f, 0.45f, 0.45f, 1.0f), "%s", name.c_str());
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.55f, 0.30f, 0.30f, 1.0f), "[mort]");
+        } else if (isLocal) {
+            ImGui::TextColored(ImVec4(0.50f, 1.0f, 0.55f, 1.0f), "%s", name.c_str());
+        } else {
+            ImGui::TextUnformatted(name.c_str());
+        }
+    }
+
+    ImGui::End();
 }
 
 // ============================================================================

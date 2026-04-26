@@ -201,6 +201,11 @@ namespace Offsets {
         constexpr uint32_t LastBonfire = 0x16C;
         constexpr uint32_t Hollowing = 0x1AC;
 
+        // Souls currency (spendable, shown in HUD)
+        // Source: Bob Edition v4.09.5 CT — PlayerData+0xF0 = current souls (int32)
+        //         PlayerData+0xF4 = SoulMemory (uint32, running total, never decreases)
+        constexpr uint32_t Souls     = 0xF0;  // int32 — spendable souls
+
         // Inventory (from PlayerData base)
         constexpr uint32_t InventoryBase = 0x12EC;
         constexpr uint32_t InventorySlotSize = 0x8;
@@ -257,6 +262,90 @@ namespace ItemIDs {
 namespace ItemCategory {
     constexpr int32_t Consumable = 3;
 }
+
+// ============================================================================
+// SetEventFlag - sets a game event flag (boss kills, discoveries, etc.)
+//
+// Signature: void __fastcall SetEventFlag(void* pFlagMan, uint32_t flagId, bool value)
+//   RCX = FlagManager*  (this)
+//   EDX = flagId        (32-bit flag identifier)
+//   R8B = value         (bool: true = set, false = clear)
+//
+// Pattern source: Ghidra analysis of DS2 SOTFS x64 executable.
+// Discriminator: the SHR EBX,5 / SHR EDX,5 immediately after the prologue
+// uniquely identifies this function (bitfield index = flagId / 32).
+//
+// Bytes:
+//   48 89 5C 24 08   MOV [RSP+8], RBX
+//   57               PUSH RDI
+//   48 83 EC 20      SUB RSP, 20h
+//   8B DA            MOV EBX, EDX     ; flagId
+//   48 8B F9         MOV RDI, RCX     ; FlagManager*
+//   C1 EB 05         SHR EBX, 5       ; array index = flagId / 32  ← KEY
+// ============================================================================
+constexpr AOBPattern SET_EVENT_FLAG = {
+    "SetEventFlag",
+    "\x48\x89\x5C\x24\x08\x57\x48\x83\xEC\x20\x8B\xDA\x48\x8B\xF9\xC1\xEB\x05",
+    "xxxxxxxxxxxxxxxxxx",
+    0, 0  // match address IS the function (not a RIP-relative pointer)
+};
+
+// ============================================================================
+// EventFlagManager offsets (Bob Edition v4.09.5 CT — DS2 SOTFS x64)
+//
+// GameManagerImp → [+0x60]  → EventFlagManager pointer
+// EventFlagManager → +0x20  → start of flag bitfield (uint32_t array)
+//
+// Flag bit access:
+//   array_index = flagId / 32 = flagId >> 5
+//   bit_mask    = 1 << (flagId & 31)
+//   set:   array[array_index] |=  bit_mask
+//   clear: array[array_index] &= ~bit_mask
+//   test:  array[array_index] &   bit_mask
+// ============================================================================
+constexpr uint32_t EFMAN_FROM_GMI   = 0x60;  // GMI → [+0x60] → EFMan ptr
+constexpr uint32_t EFMAN_FLAG_ARRAY = 0x20;  // EFMan → +0x20 → bitfield[0]
+
+// Minimum flag ID to consider for cross-player sync.
+//
+// DS2 SOTFS flag ID conventions (community-verified):
+//   0    –  999  : runtime/combat state flags (per-frame, do NOT sync)
+//   1000 – 9999  : bonfire states, area-entry triggers, tutorial flags
+//  10000 – 99999 : boss kills, NPC events, covenant/bell flags
+// 100000+        : DLC flags, NG+ markers
+//
+// We sync everything ≥ 1000 to capture bonfires lit, NPC states,
+// boss kills and DLC progression — exactly what Yui's mod covers.
+constexpr uint32_t EVENT_FLAG_SYNC_THRESHOLD = 1000;
+
+// ============================================================================
+// BONFIRE WARP function
+//
+// Signature (estimated): void __fastcall BonfireWarp(void* warpMgr, uint32_t bonfireId)
+//
+// This function is called when the player selects "Warp" from the bonfire menu.
+// It sets up the loading state and triggers the area transition.
+//
+// HOW TO FIND IN CHEAT ENGINE:
+//   1. Open CE, attach to DarkSoulsII.exe
+//   2. Set a breakpoint on PlayerData+0x16C (LastBonfire field)
+//   3. Use a bonfire warp in-game
+//   4. The breakpoint fires → look at the call stack → find the warp function
+//   5. Note the function prologue bytes and fill in the pattern below.
+//
+// Pattern is EMPTY until verified — ExecuteBonfireWarp() will fall back to
+// a notification if this pattern isn't found.
+// ============================================================================
+constexpr AOBPattern BONFIRE_WARP = {
+    "BonfireWarp",
+    "",   // TODO: fill in after Cheat Engine analysis
+    "",
+    0, 0
+};
+
+// Offset chain to the warp manager object (if different from GameManagerImp):
+// Currently assumes the warp function's first arg is obtainable from GMI.
+constexpr uint32_t WARP_MGR_FROM_GMI = 0x00;   // TODO: verify
 
 } // namespace Addresses
 } // namespace DS2Coop
