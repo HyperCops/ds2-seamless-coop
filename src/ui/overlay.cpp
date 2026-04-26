@@ -297,7 +297,7 @@ void Overlay::Render() {
     float cx = io.DisplaySize.x * 0.5f;
     float cy = io.DisplaySize.y * 0.5f;
     ImGui::SetNextWindowPos(ImVec2(cx, cy), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
-    ImGui::SetNextWindowSize(ImVec2(420, 0), ImGuiCond_Always); // auto height
+    ImGui::SetNextWindowSize(ImVec2(520, 0), ImGuiCond_Always); // auto height
 
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoResize
                            | ImGuiWindowFlags_NoMove

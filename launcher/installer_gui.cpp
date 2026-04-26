@@ -436,9 +436,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         HWND ctrl = (HWND)lParam;
         if (ctrl == g_hStatusVal) {
             HDC hdc = (HDC)wParam;
-            SetBkMode(hdc, TRANSPARENT);
+            // Use window background colour so old text is fully erased before redraw
+            SetBkColor(hdc, GetSysColor(COLOR_WINDOW));
             SetTextColor(hdc, g_colorCurrent);
-            return (LRESULT)GetStockObject(NULL_BRUSH);
+            return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
         }
         return DefWindowProcW(hwnd, msg, wParam, lParam);
     }
@@ -534,7 +535,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int nCmdShow) {
     RegisterClassExW(&wc);
 
     // Fixed-size window (no resize, no maximize — clean installer look)
-    const int W = 460, H = 310;
+    const int W = 480, H = 340;
     int sx = GetSystemMetrics(SM_CXSCREEN);
     int sy = GetSystemMetrics(SM_CYSCREEN);
 
