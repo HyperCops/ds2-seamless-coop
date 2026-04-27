@@ -196,6 +196,91 @@ Exemple : `DS2-ODUuMjMuMTE0Ljc6MjcwMTU6Y29vcA==`
 
 ---
 
+## Session Cheat Engine — AOB à trouver (prochaine session)
+
+### Contexte
+Le jeu est DS2 Scholar of the First Sin (Steam, x64, v1.02).
+Le mod est chargé via `dinput8.dll` dans le dossier du jeu.
+Les patterns trouvés vont dans `include/addresses.h`.
+
+---
+
+### 1. BonfireWarp — PRIORITÉ HAUTE
+**Pourquoi** : permet le warp automatique cross-zone quand l'hôte se déplace.
+Sans ça, `ExecuteBonfireWarp()` affiche juste une notification sans téléporter.
+
+**Comment trouver :**
+1. Ouvrir CE, attacher à `DarkSoulsII.exe`
+2. Menu CE : `Memory View → Add address manually` → adresse = `GameManagerImp + 0x38` (PlayerData), puis `+ 0x16C` (LastBonfire)
+3. Poser un **breakpoint on write** sur cette adresse (clic droit → `Find out what writes to this address`)
+4. En jeu : aller à un feu de camp → choisir **Warp** vers une autre zone
+5. CE s'arrête sur l'instruction qui écrit LastBonfire
+6. Dans le call stack (bas de la fenêtre) remonter jusqu'à la fonction qui a initié le warp
+7. Aller à cette fonction dans Memory View → noter les **8-16 premiers bytes du prologue**
+8. Copier l'adresse → `exe+0xXXXXXX` (adresse relative à la base du module)
+
+**Où mettre le résultat** dans `include/addresses.h` :
+```cpp
+constexpr AOBPattern BONFIRE_WARP = {
+    "BonfireWarp",
+    "\xXX\xXX\xXX...",   // bytes du prologue
+    "xxxxxxxx...",        // masque (x = vérifié, ? = wildcard)
+    0, 0
+};
+constexpr uint32_t WARP_MGR_FROM_GMI = 0xXX; // offset depuis GMI vers le warp manager
+```
+
+**Vérification** : `ExecuteBonfireWarp()` dans `progress_sync.cpp` scanne ce pattern au premier appel.
+
+---
+
+### 2. Matrice caméra (ViewProjection) — PRIORITÉ MOYENNE
+**Pourquoi** : permet d'afficher les noms des joueurs au-dessus de leur personnage à l'écran (projection 3D → 2D).
+
+**Comment trouver :**
+1. Dans CE, chercher les floats de la matrice 4x4 (16 floats)
+2. La matrice VP contient des valeurs comme `[0]` ≈ cot(FOV/2) / aspect_ratio, `[5]` ≈ cot(FOV/2)
+3. Méthode : chercher la valeur `cot(45°)` ≈ `1.0` ou `cot(60°/2)` ≈ `1.732` dans les floats
+4. Filtrer par "changed by code" pendant un mouvement de caméra
+5. Trouver le pointeur statique qui pointe vers ce bloc de 64 bytes
+
+**Alternative plus simple** : chercher dans les constant buffers DX11 via un outil comme RenderDoc (capturer une frame → chercher le cbuffer qui contient la VP matrix).
+
+**Où mettre le résultat** dans `include/addresses.h` :
+```cpp
+constexpr AOBPattern CAMERA_VP_MATRIX = {
+    "CameraVPMatrix",
+    "\xXX\xXX...",
+    "xxxx...",
+    3, 7  // RIP-relative pointer
+};
+```
+
+---
+
+### 3. SpawnWorldItem — PRIORITÉ BASSE
+**Pourquoi** : permet de synchroniser les drops d'items au sol (échange entre joueurs).
+
+**Comment trouver :**
+1. En jeu : équiper un item → le lâcher au sol (bouton drop dans l'inventaire)
+2. Dans CE : poser un breakpoint sur les writes à la zone d'inventaire (PlayerData + 0x12EC)
+3. Remonter le call stack jusqu'à la fonction qui crée l'entité world item
+4. Son prologue = pattern à noter
+
+**Note** : cette fonction est complexe (crée une entité physique dans le monde).
+Vérifier la signature avant d'implémenter : elle prend probablement (WorldManager*, itemId, category, x, y, z, quantity).
+
+---
+
+### Workflow après avoir trouvé un pattern
+1. Copier les bytes du prologue de la fonction (Memory View → sélectionner ~16 bytes → clic droit → Copy → Hex)
+2. Renseigner dans `include/addresses.h` l'AOBPattern correspondant
+3. Compiler (`cmake --build build --config Release`)
+4. Tester en jeu
+5. Committer avec `git commit -m "Add BonfireWarp AOB pattern (verified in-game)"`
+
+---
+
 ## Fichiers de test
 
 ```
