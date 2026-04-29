@@ -129,40 +129,42 @@ struct ItemPickupPacket {
 };
 #pragma pack(pop)
 
-// Peer information
+// Peer information — Steam-based (Steam ID = player ID)
 struct PeerInfo {
-    uint64_t playerId;
+    uint64_t playerId;       // same as steamId
+    uint64_t steamId;        // Steam64 ID
     std::string playerName;
-    uint32_t address;
-    uint16_t port;
     uint64_t lastHeartbeat;
     bool connected;
-    uint32_t ping_ms = 0;   // one-way latency estimate (ms), updated on each heartbeat received
+    uint32_t ping_ms = 0;    // round-trip latency estimate (ms)
 };
 
-// Peer manager for handling connections
+// Peer manager — Steamworks P2P transport
 class PeerManager {
 public:
     static PeerManager& GetInstance();
-    
-    bool Initialize(uint16_t port);
+
+    bool Initialize();   // no port — Steam handles routing
     void Shutdown();
-    
+
     bool CreateSession(const std::string& password);
-    bool JoinSession(const std::string& address, uint16_t port, const std::string& password);
+    bool JoinSession(uint64_t hostSteamId, const std::string& password);
     void LeaveSession();
-    
+
     void Update();
-    
+
     bool SendPacket(const PacketHeader* packet, uint64_t targetPlayerId = 0);
     void BroadcastPacket(const PacketHeader* packet);
-    
+
     const std::vector<PeerInfo>& GetPeers() const { return m_peers; }
-    bool IsHost() const { return m_isHost; }
+    bool IsHost()      const { return m_isHost; }
     bool IsConnected() const { return m_connected; }
 
-    uint64_t GetLocalPlayerId() const { return m_localPlayerId; }
+    uint64_t GetLocalPlayerId()      const { return m_localPlayerId; }
     const std::string& GetSessionPassword() const { return m_sessionPassword; }
+
+    // Called by SessionManager when lobby is established
+    void SetCurrentLobby(uint64_t lobbyId) { m_currentLobbyId = lobbyId; }
 
 private:
     PeerManager() = default;
@@ -171,22 +173,22 @@ private:
     PeerManager& operator=(const PeerManager&) = delete;
 
     void HandleIncomingPackets();
-    void HandleHandshakePacket(const struct HandshakePacket* hs, const struct sockaddr_in& senderAddr);
+    void HandleHandshakePacket(const struct HandshakePacket* hs, uint64_t senderSteamId);
+    void AcceptLobbyMembers();
     void SendHeartbeats();
     void CheckTimeouts();
 
-    bool m_initialized = false;
-    bool m_isHost = false;
-    bool m_connected = false;
+    bool     m_initialized  = false;
+    bool     m_isHost       = false;
+    bool     m_connected    = false;
     uint64_t m_localPlayerId = 0;
-    uint16_t m_port = 27015;
+    uint64_t m_currentLobbyId = 0;
     std::string m_sessionPassword;
     std::vector<PeerInfo> m_peers;
     mutable std::recursive_mutex m_peersMutex;
-    void* m_socket = nullptr;
-    uint64_t m_lastHeartbeatMs = 0;
-    uint64_t m_connectingTimestampMs = 0; // for handshake timeout
-    bool m_handshakeConfirmed = false;    // set true when host responds
+    uint64_t m_lastHeartbeatMs       = 0;
+    uint64_t m_connectingTimestampMs = 0;
+    bool     m_handshakeConfirmed    = false;
 };
 
 // Packet handler for processing received packets

@@ -23,15 +23,13 @@ struct ModConfig {
     bool enabled = true;
     bool debug_logging = false;
     uint16_t max_players = 6;
-    uint16_t port = 27015;
     bool allow_invasions = false;
     bool sync_bonfires = true;
-    bool sync_items = true;
+    bool sync_items = false;
     bool sync_enemies = false;
-    // Custom server redirect
-    std::string server_ip = "127.0.0.1";    // IP of the ds3os custom server
-    uint16_t server_port = 50031;            // Login port of custom server
-    bool use_custom_server = true;           // Enable server redirect
+    // Session password — same value on both sides triggers automatic connection.
+    // Set in ds2_seamless_coop.ini, then press INSERT in-game.
+    std::string session_password = "";
 };
 
 // Main mod class

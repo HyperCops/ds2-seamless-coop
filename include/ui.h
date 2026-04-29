@@ -47,6 +47,9 @@ public:
     void SetVisible(bool visible) { m_visible = visible; }
     void Toggle() { m_visible = !m_visible; }
 
+    // INSERT handler — toggle menu open/closed.
+    void OnInsertPressed();
+
 private:
     Overlay() = default;
     ~Overlay() = default;

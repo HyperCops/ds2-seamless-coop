@@ -19,6 +19,7 @@
 
 #include "imgui.h"
 #include "../../include/ui.h"
+#include "../../include/mod.h"
 #include "../../include/session.h"
 #include "../../include/network.h"
 #include "../../include/hooks.h"
@@ -242,6 +243,19 @@ static std::string GetLocalIP() {
 // ============================================================================
 // Overlay singleton
 // ============================================================================
+
+// INSERT handler — toggle menu.
+// With Steamworks P2P there is no "smart connect" based on server_ip.
+// The user chooses Host or Join from the menu.
+void Overlay::OnInsertPressed() {
+    if (m_visible) {
+        m_visible = false;
+        return;
+    }
+    m_visible      = true;
+    m_currentState = MenuState::Main;
+}
+
 Overlay& Overlay::GetInstance() {
     static Overlay instance;
     return instance;
@@ -463,43 +477,46 @@ void Overlay::RenderMainMenu() {
         }
 
     } else {
-        // Not in session
-        ImGui::TextDisabled("Not in a session.");
+        // Not in session — show Host / Join buttons
+        ImGui::TextDisabled("Seamless Co-op — hors session");
         ImGui::Spacing();
 
-        if (ImGui::Button("Host Session", ImVec2(-1, 0))) {
+        auto state = sessionMgr.GetState();
+        if (state == DS2Coop::Session::SessionState::Connecting) {
+            ImGui::TextColored(ImVec4(0.9f, 0.75f, 0.2f, 1.0f), "Connexion Steam en cours...");
+            ImGui::Spacing();
+        } else if (state == DS2Coop::Session::SessionState::Error) {
+            ImGui::TextColored(ImVec4(0.9f, 0.3f, 0.3f, 1.0f), "Erreur de connexion — verifiez les logs.");
+            ImGui::Spacing();
+        } else {
+            ImGui::TextColored(ImVec4(0.6f, 0.6f, 0.6f, 1.0f), "Non connecte");
+            ImGui::Spacing();
+        }
+
+        ImGui::Separator();
+        ImGui::Spacing();
+
+        if (ImGui::Button("Heberger une session", ImVec2(-1, 0))) {
             m_currentState = MenuState::Host;
-            m_inputPassword[0] = '\0';
-            m_inputIP[0] = '\0';
         }
-
         ImGui::Spacing();
-
-        if (ImGui::Button("Join Session", ImVec2(-1, 0))) {
+        if (ImGui::Button("Rejoindre une session", ImVec2(-1, 0))) {
             m_currentState = MenuState::Join;
-            m_inputPassword[0] = '\0';
-            m_inputIP[0] = '\0';
         }
 
-        // Bouton "Rejoindre la dernière session" — affiché uniquement si une session a été sauvegardée
-        std::string lastIp, lastPw;
-        if (SessionManager::GetLastSession(lastIp, lastPw)) {
+        // Rejoin last session shortcut
+        std::string lastPw;
+        if (SessionManager::GetLastPassword(lastPw)) {
             ImGui::Spacing();
             ImGui::Separator();
             ImGui::Spacing();
-            ImGui::TextDisabled("Last session:");
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.80f, 0.65f, 0.20f, 1.0f));
-            ImGui::Text("  %s", lastIp.c_str());
-            ImGui::PopStyleColor();
+            ImGui::TextDisabled("Derniere session : mot de passe \"%s\"", lastPw.c_str());
             ImGui::Spacing();
-
-            if (ImGui::Button("Rejoin Last Session", ImVec2(-1, 0))) {
-                auto& sessionMgr = SessionManager::GetInstance();
-                if (sessionMgr.JoinSession(lastIp, lastPw)) {
-                    ShowNotification("Reconnecting... waiting for host response.", 5.0f);
-                    m_currentState = MenuState::Main;
+            if (ImGui::Button("Retenter la connexion", ImVec2(-1, 0))) {
+                if (sessionMgr.JoinSession(lastPw)) {
+                    ShowNotification("Recherche du lobby en cours...", 5.0f);
                 } else {
-                    ShowNotification("Reconnection failed. Host may be offline.", 4.0f);
+                    ShowNotification("Echec. Steam disponible ?", 4.0f);
                 }
             }
         }
@@ -507,131 +524,63 @@ void Overlay::RenderMainMenu() {
 
     ImGui::Spacing();
     ImGui::Separator();
-    ImGui::TextDisabled("INSERT to close");
+    ImGui::TextDisabled("INSERT pour fermer");
 
     ImGui::End();
 }
 
 // ============================================================================
-// Host menu
+// Host menu — Steam lobby (no IP, no session codes)
 // ============================================================================
 void Overlay::RenderHostMenu() {
-    if (!ImGui::Begin("HOST SESSION###main", &m_visible, ImGuiWindowFlags_NoResize |
-                      ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
-                      ImGuiWindowFlags_NoScrollbar)) {
+    if (!ImGui::Begin("HEBERGER###main", &m_visible,
+                      ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                      ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar)) {
         ImGui::End();
         return;
     }
 
-    // Resolve IPs in the background (only once)
-    static std::string cachedLocalIP;
-    if (cachedLocalIP.empty()) cachedLocalIP = GetLocalIP();
-    EnsurePublicIPFetched();
+    ImGui::TextDisabled("Cree un lobby Steam prive.");
+    ImGui::TextDisabled("Donnez le mot de passe a vos amis pour qu'ils puissent rejoindre.");
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
 
     // ── Password field ──────────────────────────────────────────────────────
-    ImGui::TextDisabled("Session password (required):");
+    ImGui::TextDisabled("Mot de passe de session :");
     ImGui::SetNextItemWidth(-1);
     ImGui::InputText("##password", m_inputPassword, sizeof(m_inputPassword));
     ImGui::Spacing();
 
     bool hasPassword = strlen(m_inputPassword) > 0;
-    bool hasPublicIP = g_publicIPFetched && !g_publicIP.empty();
-
-    // ── Session codes (generated live once password + IP are available) ─────
-    ImGui::Separator();
-    ImGui::Spacing();
-    ImGui::TextDisabled("Share one of these codes with your friend:");
-    ImGui::TextDisabled("They paste it in Join > Session Code — done.");
-    ImGui::Spacing();
-
-    if (!hasPassword) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.6f, 0.6f, 0.6f, 1.0f));
-        ImGui::Text("  Enter a password above to generate codes.");
+    if (hasPassword) {
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 0.9f, 0.4f, 1.0f));
+        ImGui::Text("  Partagez ce mot de passe avec vos amis.");
         ImGui::PopStyleColor();
+        ImGui::Spacing();
     } else {
-        // Public code
-        if (!hasPublicIP) {
-            ImGui::TextDisabled("  Internet code: fetching IP...");
-        } else {
-            std::string pubCode = MakeSessionCode(g_publicIP, 27015, m_inputPassword);
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 0.9f, 0.4f, 1.0f));
-            ImGui::Text("  Internet:");
-            ImGui::PopStyleColor();
-            ImGui::SameLine();
-            ImGui::TextDisabled("%s", pubCode.c_str());
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Copy##codepub")) {
-                CopyToClipboard(pubCode);
-                ShowNotification("Internet session code copied!", 2.5f);
-            }
-        }
-
-        // LAN code
-        std::string lanCode = MakeSessionCode(cachedLocalIP, 27015, m_inputPassword);
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 0.7f, 1.0f, 1.0f));
-        ImGui::Text("  LAN/VPN: ");
-        ImGui::PopStyleColor();
-        ImGui::SameLine();
-        ImGui::TextDisabled("%s", lanCode.c_str());
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Copy##codelan")) {
-            CopyToClipboard(lanCode);
-            ShowNotification("LAN session code copied!", 2.5f);
-        }
+        ImGui::TextDisabled("  Entrez un mot de passe pour commencer.");
+        ImGui::Spacing();
     }
 
-    ImGui::Spacing();
     ImGui::Separator();
-    ImGui::Spacing();
-
-    // ── Advanced: raw IPs ──────────────────────────────────────────────────
-    static bool showIPs = false;
-    if (ImGui::SmallButton(showIPs ? "Hide raw IPs" : "Show raw IPs")) showIPs = !showIPs;
-    if (showIPs) {
-        ImGui::Spacing();
-        if (hasPublicIP) {
-            ImGui::TextDisabled("  Public:  %s:27015", g_publicIP.c_str());
-            ImGui::SameLine();
-            if (ImGui::SmallButton("Copy##rawpub")) {
-                CopyToClipboard(g_publicIP);
-                ShowNotification("Public IP copied!", 2.0f);
-            }
-        } else if (g_publicIPFetched) {
-            ImGui::TextDisabled("  Public:  (could not detect)");
-        } else {
-            ImGui::TextDisabled("  Public:  fetching...");
-        }
-        ImGui::TextDisabled("  LAN:     %s:27015", cachedLocalIP.c_str());
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Copy##rawlan")) {
-            CopyToClipboard(cachedLocalIP);
-            ShowNotification("LAN IP copied!", 2.0f);
-        }
-        ImGui::Spacing();
-    }
-
     ImGui::Spacing();
 
     // ── Start / Back ───────────────────────────────────────────────────────
     ImGui::BeginDisabled(!hasPassword);
-    if (ImGui::Button("Start Hosting", ImVec2(-1, 0))) {
+    if (ImGui::Button("Demarrer l'hebergement", ImVec2(-1, 0))) {
         auto& sessionMgr = SessionManager::GetInstance();
         if (sessionMgr.CreateSession(m_inputPassword)) {
-            // Cache codes for display in the active-session panel
-            if (hasPublicIP)
-                m_activePublicCode = MakeSessionCode(g_publicIP, 27015, m_inputPassword);
-            m_activeLANCode = MakeSessionCode(cachedLocalIP, 27015, m_inputPassword);
-
-            ShowNotification("Hosting!  Share the session code with friends.", 6.0f);
+            ShowNotification("Creation du lobby Steam...", 4.0f);
             m_currentState = MenuState::Main;
         } else {
-            ShowNotification("Failed to create session. Check log.", 4.0f);
+            ShowNotification("Echec de creation de session. Verifiez les logs.", 4.0f);
         }
     }
     ImGui::EndDisabled();
 
     ImGui::Spacing();
-    if (ImGui::Button("Back", ImVec2(-1, 0))) {
+    if (ImGui::Button("Retour", ImVec2(-1, 0))) {
         m_currentState = MenuState::Main;
     }
 
@@ -639,103 +588,53 @@ void Overlay::RenderHostMenu() {
 }
 
 // ============================================================================
-// Join menu
+// Join menu — Steam lobby discovery by password
 // ============================================================================
 void Overlay::RenderJoinMenu() {
-    if (!ImGui::Begin("JOIN SESSION###main", &m_visible, ImGuiWindowFlags_NoResize |
-                      ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse |
-                      ImGuiWindowFlags_NoScrollbar)) {
+    if (!ImGui::Begin("REJOINDRE###main", &m_visible,
+                      ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+                      ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar)) {
         ImGui::End();
         return;
     }
 
-    // ── Mode 1 : Session Code (preferred) ──────────────────────────────────
-    ImGui::TextDisabled("Session Code:");
-    ImGui::TextDisabled("  (paste the DS2-... code the host sent you)");
-    ImGui::Spacing();
-    ImGui::SetNextItemWidth(-1);
-    bool codeChanged = ImGui::InputText("##code", m_codeInput, sizeof(m_codeInput),
-                                        ImGuiInputTextFlags_CharsNoBlank);
-    (void)codeChanged;
-
-    // Try to decode on the fly so we can give live feedback
-    std::string codeStr(m_codeInput);
-    bool isCode = !codeStr.empty() && codeStr.size() > 4 && codeStr.substr(0, 4) == "DS2-";
-    std::string decodedIP;
-    uint16_t    decodedPort = 27015;
-    std::string decodedPW;
-    bool codeValid = false;
-
-    if (isCode) {
-        codeValid = ParseSessionCode(codeStr, decodedIP, decodedPort, decodedPW);
-        if (codeValid) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 0.9f, 0.4f, 1.0f));
-            ImGui::Text("  Valid code: %s:%u", decodedIP.c_str(), decodedPort);
-            ImGui::PopStyleColor();
-        } else {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.9f, 0.3f, 0.3f, 1.0f));
-            ImGui::Text("  Invalid code — check for typos.");
-            ImGui::PopStyleColor();
-        }
-    } else if (!codeStr.empty()) {
-        ImGui::TextDisabled("  (not a DS2 session code — use manual fields below)");
-    }
-
-    ImGui::Spacing();
-
-    ImGui::BeginDisabled(!codeValid);
-    if (ImGui::Button("Connect with Code", ImVec2(-1, 0))) {
-        auto& sessionMgr = SessionManager::GetInstance();
-        if (sessionMgr.JoinSession(decodedIP, decodedPW)) {
-            ShowNotification("Connecting... waiting for host response.", 5.0f);
-            m_currentState = MenuState::Main;
-        } else {
-            ShowNotification("Connection failed. Check code or ask host to re-share.", 4.0f);
-        }
-    }
-    ImGui::EndDisabled();
-
-    // ── Separator ──────────────────────────────────────────────────────────
+    ImGui::TextDisabled("Rejoindre la session Steam d'un ami.");
+    ImGui::TextDisabled("Entrez le meme mot de passe que l'hote.");
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
-    ImGui::TextDisabled("— or enter manually —");
-    ImGui::Spacing();
 
-    // ── Mode 2 : Manual IP + password ──────────────────────────────────────
-    ImGui::TextDisabled("Host's IP address:");
-    ImGui::SetNextItemWidth(-1);
-    ImGui::InputText("##ip", m_inputIP, sizeof(m_inputIP),
-                     ImGuiInputTextFlags_CharsNoBlank);
-
-    ImGui::Spacing();
-    ImGui::TextDisabled("Session password:");
+    // ── Password field ──────────────────────────────────────────────────────
+    ImGui::TextDisabled("Mot de passe de session :");
     ImGui::SetNextItemWidth(-1);
     ImGui::InputText("##pw", m_inputPassword, sizeof(m_inputPassword));
-
     ImGui::Spacing();
 
-    bool canJoinManual = strlen(m_inputIP) > 0 && strlen(m_inputPassword) > 0;
+    bool hasPassword = strlen(m_inputPassword) > 0;
 
-    if (!canJoinManual) {
-        ImGui::TextDisabled("Fill in IP and password to continue.");
+    if (!hasPassword) {
+        ImGui::TextDisabled("Entrez le mot de passe communique par l'hote.");
         ImGui::Spacing();
     }
 
-    ImGui::BeginDisabled(!canJoinManual);
-    if (ImGui::Button("Connect", ImVec2(-1, 0))) {
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // ── Join button ─────────────────────────────────────────────────────────
+    ImGui::BeginDisabled(!hasPassword);
+    if (ImGui::Button("Rejoindre la session", ImVec2(-1, 0))) {
         auto& sessionMgr = SessionManager::GetInstance();
-        if (sessionMgr.JoinSession(m_inputIP, m_inputPassword)) {
-            ShowNotification("Connecting... waiting for host response.", 5.0f);
+        if (sessionMgr.JoinSession(m_inputPassword)) {
+            ShowNotification("Recherche du lobby Steam...", 5.0f);
             m_currentState = MenuState::Main;
         } else {
-            ShowNotification("Connection failed. Check IP/password.", 4.0f);
+            ShowNotification("Impossible de demarrer la recherche. Steam disponible ?", 4.0f);
         }
     }
     ImGui::EndDisabled();
 
     ImGui::Spacing();
-    if (ImGui::Button("Back", ImVec2(-1, 0))) {
+    if (ImGui::Button("Retour", ImVec2(-1, 0))) {
         m_currentState = MenuState::Main;
     }
 

@@ -38,7 +38,7 @@ public:
     void Shutdown();
     
     bool CreateSession(const std::string& password);
-    bool JoinSession(const std::string& address, const std::string& password);
+    bool JoinSession(const std::string& password);
     void LeaveSession();
     
     void Update(float deltaTime);
@@ -73,8 +73,8 @@ public:
     void PreventDisconnection();
     void AllowDisconnection();
 
-    // Dernière session connue (pour le bouton "Rejoindre")
-    static bool GetLastSession(std::string& outIp, std::string& outPassword);
+    // Dernier mot de passe connu (pour le bouton "Rejoindre dernière session")
+    static bool GetLastPassword(std::string& outPassword);
 
 private:
     SessionManager() = default;
@@ -92,7 +92,14 @@ private:
     uint64_t m_localPlayerId = 0;
     std::string m_sessionPassword;
     std::vector<SessionPlayer> m_players;
-    mutable std::mutex m_playersMutex; // protects m_players from concurrent access
+    mutable std::mutex m_playersMutex;
+
+    // Steam lobby async state (SteamAPICall_t stored as uint64 to avoid Steam header dep)
+    uint64_t m_createLobbyCall  = 0;
+    uint64_t m_requestLobbyCall = 0;
+    uint64_t m_joinLobbyCall    = 0;
+    uint64_t m_currentLobbyId   = 0;
+    std::string m_pendingPassword;   // held during async join
 };
 
 } // namespace DS2Coop::Session

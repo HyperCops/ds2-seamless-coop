@@ -1,6 +1,9 @@
 // Session manager - tracks players, drives sync loops
 //
 // Coordinates between PeerManager (networking) and PlayerSync/ProgressSync.
+// Session creation/joining is fully async via Steam lobbies:
+//   CreateSession → SteamMM::CreateLobby (async) → SetLobbyData → Connected
+//   JoinSession   → RequestLobbyList (async) → JoinLobby (async) → P2P handshake → Connected
 
 #include "../../include/session.h"
 #include "../../include/network.h"
@@ -8,6 +11,8 @@
 #include "../../include/sync.h"
 #include "../../include/ui.h"
 #include "../../include/utils.h"
+#include "../../include/mod.h"
+#include "../../third_party/steamworks/steam_minimal.h"
 #include <algorithm>
 #include <fstream>
 #include <mmsystem.h>
@@ -18,24 +23,23 @@ using namespace DS2Coop::Session;
 using namespace DS2Coop::Utils;
 
 // ============================================================================
-// Persistance de la dernière session pour le bouton "Rejoindre"
+// Persistance du dernier mot de passe pour le bouton "Rejoindre dernière session"
 // ============================================================================
-static const char* LAST_SESSION_FILE = "ds2_last_session.ini";
+static const char* LAST_PASSWORD_FILE = "ds2_last_session.ini";
 
-static void SaveLastSession(const std::string& ip, const std::string& password) {
-    std::ofstream f(LAST_SESSION_FILE);
+static void SaveLastPassword(const std::string& password) {
+    std::ofstream f(LAST_PASSWORD_FILE);
     if (f.is_open()) {
-        f << "ip=" << ip << "\n";
         f << "password=" << password << "\n";
     }
 }
 
-static void ClearLastSession() {
-    std::remove(LAST_SESSION_FILE);
+static void ClearLastPassword() {
+    std::remove(LAST_PASSWORD_FILE);
 }
 
-static bool LoadLastSession(std::string& outIp, std::string& outPassword) {
-    std::ifstream f(LAST_SESSION_FILE);
+static bool LoadLastPassword(std::string& outPassword) {
+    std::ifstream f(LAST_PASSWORD_FILE);
     if (!f.is_open()) return false;
     std::string line;
     while (std::getline(f, line)) {
@@ -43,10 +47,9 @@ static bool LoadLastSession(std::string& outIp, std::string& outPassword) {
         if (eq == std::string::npos) continue;
         std::string key = line.substr(0, eq);
         std::string val = line.substr(eq + 1);
-        if (key == "ip")       outIp       = val;
         if (key == "password") outPassword = val;
     }
-    return !outIp.empty() && !outPassword.empty();
+    return !outPassword.empty();
 }
 
 SessionManager& SessionManager::GetInstance() {
@@ -79,40 +82,38 @@ void SessionManager::Shutdown() {
 
 bool SessionManager::CreateSession(const std::string& password) {
     if (!m_initialized) return false;
-
-    LOG_INFO("Creating new session...");
-
-    TransitionToState(SessionState::Connecting);
-
-    m_isHost = true;
-    m_sessionPassword = password;
-
-    // Create network session
-    auto& peerMgr = Network::PeerManager::GetInstance();
-    if (!peerMgr.CreateSession(password)) {
-        LOG_ERROR("Failed to create network session");
-        TransitionToState(SessionState::Error);
+    if (m_state == SessionState::Connecting || m_state == SessionState::Connected ||
+        m_state == SessionState::InGame) {
+        LOG_WARNING("CreateSession called while already in state %d", (int)m_state);
         return false;
     }
 
-    // Use PeerManager's generated player ID
+    LOG_INFO("Creating new session (Steam lobby)...");
+
+    TransitionToState(SessionState::Connecting);
+
+    m_isHost         = true;
+    m_sessionPassword = password;
+
+    // PeerManager: set up host flag + crypto key immediately so we can receive
+    // incoming P2P connections while the lobby creation is in flight.
+    auto& peerMgr = Network::PeerManager::GetInstance();
+    peerMgr.CreateSession(password);
     m_localPlayerId = peerMgr.GetLocalPlayerId();
 
-    // Add local player
-    SessionPlayer localPlayer{};
-    localPlayer.playerId = m_localPlayerId;
-    localPlayer.isAlive = true;
-    localPlayer.isReady = true;
-    localPlayer.soulLevel = 0;
-    localPlayer.health = 0;
-    localPlayer.maxHealth = 0;
-    localPlayer.x = localPlayer.y = localPlayer.z = 0.0f;
-
-    // Initialize sync systems first so we can read the character name
+    // Initialize sync systems so we can read the character name
     Sync::PlayerSync::GetInstance().Initialize();
     Sync::ProgressSync::GetInstance().Initialize();
 
-    // Read actual character name from game memory
+    // Add local player entry
+    SessionPlayer localPlayer{};
+    localPlayer.playerId  = m_localPlayerId;
+    localPlayer.isAlive   = true;
+    localPlayer.isReady   = true;
+    localPlayer.soulLevel = 0;
+    localPlayer.health = localPlayer.maxHealth = 0;
+    localPlayer.x = localPlayer.y = localPlayer.z = 0.0f;
+
     std::string charName = Sync::PlayerSync::GetInstance().GetLocalCharacterName();
     localPlayer.playerName = charName.empty() ? "Host" : charName;
 
@@ -121,63 +122,59 @@ bool SessionManager::CreateSession(const std::string& password) {
         m_players.push_back(localPlayer);
     }
 
-    TransitionToState(SessionState::Connected);
-
-    // Set up sign filtering — add our own Steam ID to the whitelist
+    // Set up sign filtering
     Hooks::ProtobufHooks::ClearSessionSteamIds();
     std::string localSteam = Hooks::ProtobufHooks::GetLocalSteamId();
-    if (!localSteam.empty()) {
+    if (!localSteam.empty())
         Hooks::ProtobufHooks::AddSessionSteamId(localSteam);
-    }
 
-    // Reset boss-kill deduplication so flags can be re-broadcast if peers join later
     Hooks::GameState::ClearBroadcastFlagCache();
 
-    LOG_INFO("Session created. Local player ID: %llu", m_localPlayerId);
+    // Kick off async Steam lobby creation
+    void* mm = SteamAPI::Matchmaking();
+    if (!mm) {
+        LOG_ERROR("SteamMatchmaking unavailable — cannot create lobby");
+        TransitionToState(SessionState::Error);
+        return false;
+    }
+
+    const auto& cfg = DS2Coop::SeamlessCoopMod::GetInstance().GetConfig();
+    m_createLobbyCall = SteamMM::CreateLobby(mm, k_ELobbyTypePrivate,
+                                              static_cast<int>(cfg.max_players));
+    LOG_INFO("Steam CreateLobby dispatched (async)... password='%s'", password.c_str());
     return true;
 }
 
-bool SessionManager::JoinSession(const std::string& address, const std::string& password) {
+bool SessionManager::JoinSession(const std::string& password) {
     if (!m_initialized) return false;
+    if (m_state == SessionState::Connecting || m_state == SessionState::Connected ||
+        m_state == SessionState::InGame) {
+        LOG_WARNING("JoinSession called while already in state %d", (int)m_state);
+        return false;
+    }
 
-    LOG_INFO("Joining session at %s...", address.c_str());
+    LOG_INFO("Searching for session with password '%s'...", password.c_str());
 
     TransitionToState(SessionState::Connecting);
 
-    m_isHost = false;
+    m_isHost          = false;
     m_sessionPassword = password;
-
-    // Parse address (ip or ip:port)
-    size_t colonPos = address.find(':');
-    std::string ip = address.substr(0, colonPos);
-    uint16_t port = 27015;
-    if (colonPos != std::string::npos) {
-        port = static_cast<uint16_t>(std::stoi(address.substr(colonPos + 1)));
-    }
+    m_pendingPassword = password;
 
     // Initialize sync systems BEFORE joining P2P so the handshake has the real name
     Sync::PlayerSync::GetInstance().Initialize();
     Sync::ProgressSync::GetInstance().Initialize();
 
-    // Join network session
     auto& peerMgr = Network::PeerManager::GetInstance();
-    if (!peerMgr.JoinSession(ip, port, password)) {
-        LOG_ERROR("Failed to join network session");
-        TransitionToState(SessionState::Error);
-        return false;
-    }
-
-    // Use PeerManager's generated player ID
     m_localPlayerId = peerMgr.GetLocalPlayerId();
 
-    // Add local player
+    // Add local player entry
     SessionPlayer localPlayer{};
-    localPlayer.playerId = m_localPlayerId;
-    localPlayer.isAlive = true;
-    localPlayer.isReady = true;
+    localPlayer.playerId  = m_localPlayerId;
+    localPlayer.isAlive   = true;
+    localPlayer.isReady   = true;
     localPlayer.soulLevel = 0;
-    localPlayer.health = 0;
-    localPlayer.maxHealth = 0;
+    localPlayer.health = localPlayer.maxHealth = 0;
     localPlayer.x = localPlayer.y = localPlayer.z = 0.0f;
 
     std::string charName = Sync::PlayerSync::GetInstance().GetLocalCharacterName();
@@ -188,22 +185,30 @@ bool SessionManager::JoinSession(const std::string& address, const std::string& 
         m_players.push_back(localPlayer);
     }
 
-    TransitionToState(SessionState::Connected);
-
     // Set up sign filtering
     Hooks::ProtobufHooks::ClearSessionSteamIds();
     std::string localSteam = Hooks::ProtobufHooks::GetLocalSteamId();
-    if (!localSteam.empty()) {
+    if (!localSteam.empty())
         Hooks::ProtobufHooks::AddSessionSteamId(localSteam);
-    }
 
-    // Sauvegarder pour le bouton "Rejoindre dernière session"
-    SaveLastSession(address, password);
-
-    // Reset boss-kill deduplication
     Hooks::GameState::ClearBroadcastFlagCache();
 
-    LOG_INFO("Joined session. Local player ID: %llu", m_localPlayerId);
+    // Kick off async lobby list search filtered by our password
+    void* mm = SteamAPI::Matchmaking();
+    if (!mm) {
+        LOG_ERROR("SteamMatchmaking unavailable — cannot search for lobby");
+        TransitionToState(SessionState::Error);
+        return false;
+    }
+
+    SteamMM::AddRequestLobbyListStringFilter(mm, "ds2coop_pw", password.c_str(),
+                                             k_ELobbyComparisonEqual);
+    SteamMM::AddRequestLobbyListResultCountFilter(mm, 1);
+    m_requestLobbyCall = SteamMM::RequestLobbyList(mm);
+
+    SaveLastPassword(password);
+
+    LOG_INFO("Steam RequestLobbyList dispatched (async)...");
     return true;
 }
 
@@ -212,17 +217,27 @@ void SessionManager::LeaveSession() {
 
     LOG_INFO("Leaving session...");
 
-    // Effacer la sauvegarde de dernière session à la déconnexion volontaire
-    ClearLastSession();
+    // Cancel pending async calls
+    m_createLobbyCall  = 0;
+    m_requestLobbyCall = 0;
+    m_joinLobbyCall    = 0;
 
-    // Reset boss-kill deduplication so the next session starts clean
+    // Leave Steam lobby
+    if (m_currentLobbyId != 0) {
+        void* mm = SteamAPI::Matchmaking();
+        if (mm)
+            SteamMM::LeaveLobby(mm, CSteamID(m_currentLobbyId));
+        m_currentLobbyId = 0;
+    }
+
+    // Effacer la sauvegarde de dernière session à la déconnexion volontaire
+    ClearLastPassword();
+
     Hooks::GameState::ClearBroadcastFlagCache();
 
-    // Leave network session
     auto& peerMgr = Network::PeerManager::GetInstance();
     peerMgr.LeaveSession();
 
-    // Clear players
     {
         std::lock_guard<std::mutex> lock(m_playersMutex);
         m_players.clear();
@@ -234,6 +249,108 @@ void SessionManager::LeaveSession() {
 }
 
 void SessionManager::Update(float deltaTime) {
+    // Always pump Steam's callback queue
+    SteamAPI::RunCallbacks();
+
+    // Poll async Steam lobby operations (even in Connecting state)
+    if (m_state != SessionState::Disconnected) {
+        void* utils = SteamAPI::Utils();
+        void* mm    = SteamAPI::Matchmaking();
+
+        if (utils && mm) {
+            bool failed = false;
+
+            // ── Create lobby result (host) ─────────────────────────────────
+            if (m_createLobbyCall != 0) {
+                if (SteamUt::IsAPICallCompleted(utils, m_createLobbyCall, &failed)) {
+                    LobbyCreated_t result{};
+                    SteamUt::GetAPICallResult(utils, m_createLobbyCall,
+                        &result, sizeof(result), LobbyCreated_t::k_iCallback, &failed);
+                    m_createLobbyCall = 0;
+
+                    if (!failed && result.m_eResult == 1 /* k_EResultOK */) {
+                        m_currentLobbyId = result.m_ulSteamIDLobby;
+
+                        // Tag lobby with password so joiners can find it
+                        SteamMM::SetLobbyData(mm, CSteamID(m_currentLobbyId),
+                                              "ds2coop_pw", m_sessionPassword.c_str());
+
+                        Network::PeerManager::GetInstance().SetCurrentLobby(m_currentLobbyId);
+
+                        TransitionToState(SessionState::Connected);
+                        LOG_INFO("Steam lobby created: %llu (password='%s')",
+                                 m_currentLobbyId, m_sessionPassword.c_str());
+                        UI::Overlay::GetInstance().ShowNotification(
+                            "Session creee ! Partagez le mot de passe.", 6.0f);
+                    } else {
+                        LOG_ERROR("Steam CreateLobby failed (eResult=%u, apiCallFailed=%d)",
+                                  result.m_eResult, (int)failed);
+                        TransitionToState(SessionState::Error);
+                        UI::Overlay::GetInstance().ShowNotification(
+                            "Echec creation du lobby Steam. Verifiez Steam.", 5.0f);
+                    }
+                }
+            }
+
+            // ── RequestLobbyList result (joiner) ──────────────────────────
+            if (m_requestLobbyCall != 0) {
+                if (SteamUt::IsAPICallCompleted(utils, m_requestLobbyCall, &failed)) {
+                    LobbyMatchList_t result{};
+                    SteamUt::GetAPICallResult(utils, m_requestLobbyCall,
+                        &result, sizeof(result), LobbyMatchList_t::k_iCallback, &failed);
+                    m_requestLobbyCall = 0;
+
+                    if (!failed && result.m_nLobbiesMatching > 0) {
+                        CSteamID lobbyId = SteamMM::GetLobbyByIndex(mm, 0);
+                        m_joinLobbyCall  = SteamMM::JoinLobby(mm, lobbyId);
+                        LOG_INFO("Found %u lobby/lobbies with matching password — joining...",
+                                 result.m_nLobbiesMatching);
+                    } else {
+                        LOG_WARNING("No lobby found for password '%s' (count=%u, failed=%d)",
+                                    m_sessionPassword.c_str(),
+                                    result.m_nLobbiesMatching, (int)failed);
+                        TransitionToState(SessionState::Error);
+                        UI::Overlay::GetInstance().ShowNotification(
+                            "Aucun lobby trouve — l'hote est-il en ligne ?", 5.0f);
+                    }
+                }
+            }
+
+            // ── JoinLobby result (joiner) ─────────────────────────────────
+            if (m_joinLobbyCall != 0) {
+                if (SteamUt::IsAPICallCompleted(utils, m_joinLobbyCall, &failed)) {
+                    LobbyEnter_t result{};
+                    SteamUt::GetAPICallResult(utils, m_joinLobbyCall,
+                        &result, sizeof(result), LobbyEnter_t::k_iCallback, &failed);
+                    m_joinLobbyCall = 0;
+
+                    if (!failed && result.m_EChatRoomEnterResponse == 1 /* success */) {
+                        m_currentLobbyId = result.m_ulSteamIDLobby;
+
+                        CSteamID hostId = SteamMM::GetLobbyOwner(
+                            mm, CSteamID(m_currentLobbyId));
+
+                        auto& peerMgr = Network::PeerManager::GetInstance();
+                        peerMgr.SetCurrentLobby(m_currentLobbyId);
+                        peerMgr.JoinSession(hostId.ConvertToUint64(), m_sessionPassword);
+
+                        TransitionToState(SessionState::Connected);
+                        LOG_INFO("Joined lobby %llu, host SteamID=%llu",
+                                 m_currentLobbyId, hostId.ConvertToUint64());
+                        UI::Overlay::GetInstance().ShowNotification(
+                            "Lobby rejoint ! En attente de l'hote...", 5.0f);
+                    } else {
+                        LOG_ERROR("JoinLobby failed (response=%u, failed=%d)",
+                                  result.m_EChatRoomEnterResponse, (int)failed);
+                        TransitionToState(SessionState::Error);
+                        UI::Overlay::GetInstance().ShowNotification(
+                            "Impossible de rejoindre le lobby Steam.", 5.0f);
+                    }
+                }
+            }
+        }
+    }
+
     if (!IsActive()) return;
 
     // Update networking (receive packets, send heartbeats)
@@ -254,7 +371,6 @@ void SessionManager::AddPlayer(uint64_t playerId, const std::string& name) {
 
     std::lock_guard<std::mutex> lock(m_playersMutex);
 
-    // Don't add duplicates
     for (const auto& p : m_players) {
         if (p.playerId == playerId) {
             LOG_DEBUG("Player %llu already in session", playerId);
@@ -263,13 +379,13 @@ void SessionManager::AddPlayer(uint64_t playerId, const std::string& name) {
     }
 
     SessionPlayer newPlayer{};
-    newPlayer.playerId = playerId;
-    newPlayer.playerName = name;
-    newPlayer.isAlive = true;
-    newPlayer.isReady = true;
-    newPlayer.soulLevel = 0;
-    newPlayer.health = 0;
-    newPlayer.maxHealth = 0;
+    newPlayer.playerId    = playerId;
+    newPlayer.playerName  = name;
+    newPlayer.isAlive     = true;
+    newPlayer.isReady     = true;
+    newPlayer.soulLevel   = 0;
+    newPlayer.health      = 0;
+    newPlayer.maxHealth   = 0;
     newPlayer.x = newPlayer.y = newPlayer.z = 0.0f;
 
     m_players.push_back(newPlayer);
@@ -277,11 +393,8 @@ void SessionManager::AddPlayer(uint64_t playerId, const std::string& name) {
     LOG_INFO("Player joined session: %s (ID: %llu) [Total: %zu players]",
              name.c_str(), playerId, m_players.size());
 
-    // DS2-style centered notification is shown by packet_handler.cpp (HandleHandshake).
-    // Only play the system sound here — no duplicate bottom-left notification.
     PlaySoundW(L"SystemAsterisk", nullptr, SND_ALIAS | SND_ASYNC);
 
-    // Ensure seamless mode is active now that we have a real co-op partner
     Hooks::ProtobufHooks::SetSeamlessActive(true);
 }
 
@@ -299,32 +412,25 @@ void SessionManager::RemovePlayer(uint64_t playerId) {
         m_players.end()
     );
 
-    // Nettoyer l'état de séquence UDP du joueur
     Network::PacketHandler::GetInstance().RemovePlayer(playerId);
 
     LOG_INFO("Player left session: %s (ID: %llu) [Total: %zu players]",
              name.c_str(), playerId, m_players.size());
 
-    // DS2-style centered notification is shown by packet_handler.cpp (Disconnect case).
-    // Only play the system sound here — no duplicate bottom-left notification.
-    if (!name.empty()) {
+    if (!name.empty())
         PlaySoundW(L"SystemExclamation", nullptr, SND_ALIAS | SND_ASYNC);
-    }
 
-    // Si on se retrouve seul, programmer la désactivation du seamless mode dans un thread
-    // séparé avec un délai de 5s pour laisser passer les messages in-flight du joueur sortant.
     if (m_players.size() <= 1) {
         LOG_INFO("All remote players gone — scheduling seamless mode deactivation in 5s");
         UI::Overlay::GetInstance().ShowNotification("Session empty. Waiting for players...", 5.0f);
 
         CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
             Sleep(5000);
-            // Vérifier qu'on est toujours seul avant de désactiver
-            auto& sm = DS2Coop::Session::SessionManager::GetInstance();
-            auto players = sm.GetPlayers();
-            auto* local = sm.GetLocalPlayer();
+            auto& sm      = DS2Coop::Session::SessionManager::GetInstance();
+            auto  players = sm.GetPlayers();
+            auto* local   = sm.GetLocalPlayer();
             uint64_t localId = local ? local->playerId : 0;
-            bool stillAlone = true;
+            bool stillAlone  = true;
             for (const auto& p : players) {
                 if (p.playerId != localId) { stillAlone = false; break; }
             }
@@ -338,10 +444,8 @@ void SessionManager::RemovePlayer(uint64_t playerId) {
 }
 
 SessionPlayer* SessionManager::GetPlayer(uint64_t playerId) {
-    // Caller must hold m_playersMutex or be on the update thread
-    for (auto& p : m_players) {
+    for (auto& p : m_players)
         if (p.playerId == playerId) return &p;
-    }
     return nullptr;
 }
 
@@ -352,37 +456,29 @@ SessionPlayer* SessionManager::GetLocalPlayer() {
 void SessionManager::UpdatePlayerPosition(uint64_t playerId, float x, float y, float z) {
     std::lock_guard<std::mutex> lock(m_playersMutex);
     SessionPlayer* player = GetPlayer(playerId);
-    if (player) {
-        player->x = x;
-        player->y = y;
-        player->z = z;
-    }
+    if (player) { player->x = x; player->y = y; player->z = z; }
 }
 
 void SessionManager::UpdatePlayerHealth(uint64_t playerId, int32_t health, int32_t maxHealth) {
     std::lock_guard<std::mutex> lock(m_playersMutex);
     SessionPlayer* player = GetPlayer(playerId);
     if (player) {
-        player->health = health;
+        player->health    = health;
         player->maxHealth = maxHealth;
-        player->isAlive = (health > 0);
+        player->isAlive   = (health > 0);
     }
 }
 
 void SessionManager::UpdatePlayerLevel(uint64_t playerId, uint32_t soulLevel) {
     std::lock_guard<std::mutex> lock(m_playersMutex);
     SessionPlayer* player = GetPlayer(playerId);
-    if (player) {
-        player->soulLevel = soulLevel;
-    }
+    if (player) player->soulLevel = soulLevel;
 }
 
 void SessionManager::UpdatePlayerPing(uint64_t playerId, uint32_t ping_ms) {
     std::lock_guard<std::mutex> lock(m_playersMutex);
     SessionPlayer* player = GetPlayer(playerId);
-    if (player) {
-        player->ping_ms = ping_ms;
-    }
+    if (player) player->ping_ms = ping_ms;
 }
 
 void SessionManager::NotifyPlayerDeath(uint64_t playerId) {
@@ -396,12 +492,11 @@ void SessionManager::NotifyPlayerDeath(uint64_t playerId) {
             shouldBroadcast = true;
         }
     }
-    // Broadcast OUTSIDE the lock to avoid deadlock with m_peersMutex
     if (shouldBroadcast) {
         Network::PacketHeader deathPacket{};
-        deathPacket.magic = 0x44533243;
-        deathPacket.type = Network::PacketType::PlayerDeath;
-        deathPacket.size = sizeof(Network::PacketHeader);
+        deathPacket.magic  = 0x44533243;
+        deathPacket.type   = Network::PacketType::PlayerDeath;
+        deathPacket.size   = sizeof(Network::PacketHeader);
         deathPacket.timestamp = 0;
         Network::PeerManager::GetInstance().BroadcastPacket(&deathPacket);
     }
@@ -420,9 +515,9 @@ void SessionManager::NotifyPlayerRespawn(uint64_t playerId) {
     }
     if (shouldBroadcast) {
         Network::PacketHeader respawnPacket{};
-        respawnPacket.magic = 0x44533243;
-        respawnPacket.type = Network::PacketType::PlayerRespawn;
-        respawnPacket.size = sizeof(Network::PacketHeader);
+        respawnPacket.magic  = 0x44533243;
+        respawnPacket.type   = Network::PacketType::PlayerRespawn;
+        respawnPacket.size   = sizeof(Network::PacketHeader);
         respawnPacket.timestamp = 0;
         Network::PeerManager::GetInstance().BroadcastPacket(&respawnPacket);
     }
@@ -433,13 +528,12 @@ void SessionManager::OnBossDefeated(uint32_t bossId) {
 
     Network::BossDefeatedPacket packet{};
     packet.header.magic = 0x44533243;
-    packet.header.type = Network::PacketType::BossDefeated;
-    packet.header.size = sizeof(Network::BossDefeatedPacket);
-    packet.bossId = bossId;
-    packet.defeatTime = 0;
+    packet.header.type  = Network::PacketType::BossDefeated;
+    packet.header.size  = sizeof(Network::BossDefeatedPacket);
+    packet.bossId       = bossId;
+    packet.defeatTime   = 0;
 
-    auto& peerMgr = Network::PeerManager::GetInstance();
-    peerMgr.BroadcastPacket(&packet.header);
+    Network::PeerManager::GetInstance().BroadcastPacket(&packet.header);
 }
 
 void SessionManager::OnBonfireRested(uint32_t bonfireId) {
@@ -447,13 +541,12 @@ void SessionManager::OnBonfireRested(uint32_t bonfireId) {
 
     Network::EventFlagPacket packet{};
     packet.header.magic = 0x44533243;
-    packet.header.type = Network::PacketType::BonfireRest;
-    packet.header.size = sizeof(Network::EventFlagPacket);
-    packet.flagId = bonfireId;
-    packet.flagValue = true;
+    packet.header.type  = Network::PacketType::BonfireRest;
+    packet.header.size  = sizeof(Network::EventFlagPacket);
+    packet.flagId       = bonfireId;
+    packet.flagValue    = true;
 
-    auto& peerMgr = Network::PeerManager::GetInstance();
-    peerMgr.BroadcastPacket(&packet.header);
+    Network::PeerManager::GetInstance().BroadcastPacket(&packet.header);
 }
 
 void SessionManager::OnFogGateEntered(uint32_t fogGateId) {
@@ -461,13 +554,12 @@ void SessionManager::OnFogGateEntered(uint32_t fogGateId) {
 
     Network::EventFlagPacket packet{};
     packet.header.magic = 0x44533243;
-    packet.header.type = Network::PacketType::FogGateTransition;
-    packet.header.size = sizeof(Network::EventFlagPacket);
-    packet.flagId = fogGateId;
-    packet.flagValue = true;
+    packet.header.type  = Network::PacketType::FogGateTransition;
+    packet.header.size  = sizeof(Network::EventFlagPacket);
+    packet.flagId       = fogGateId;
+    packet.flagValue    = true;
 
-    auto& peerMgr = Network::PeerManager::GetInstance();
-    peerMgr.BroadcastPacket(&packet.header);
+    Network::PeerManager::GetInstance().BroadcastPacket(&packet.header);
 }
 
 void SessionManager::PreventDisconnection() {
@@ -490,6 +582,6 @@ void SessionManager::SynchronizePlayers() {
     // Driven by PlayerSync::Update now
 }
 
-bool SessionManager::GetLastSession(std::string& outIp, std::string& outPassword) {
-    return LoadLastSession(outIp, outPassword);
+bool SessionManager::GetLastPassword(std::string& outPassword) {
+    return LoadLastPassword(outPassword);
 }

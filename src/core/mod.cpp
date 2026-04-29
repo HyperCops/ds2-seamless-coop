@@ -83,86 +83,40 @@ bool SeamlessCoopMod::Initialize() {
     bool protobufHooked = Hooks::ProtobufHooks::InstallHooks();
     if (protobufHooked) {
         LOG_INFO("  Protobuf hooks ACTIVE - disconnect blocking available");
-        // Enable seamless mode immediately
-        Hooks::ProtobufHooks::SetSeamlessActive(true);
+        // Seamless mode is OFF by default — only enabled once a P2P handshake
+        // is confirmed (SessionManager::AddPlayer calls SetSeamlessActive(true)).
+        // Enabling it here would block disconnect messages before any session
+        // exists, interfering with normal DS2 server auth flow.
+        Hooks::ProtobufHooks::SetSeamlessActive(false);
     } else {
         LOG_ERROR("  Protobuf hooks FAILED - mod running in passive mode");
         LOG_ERROR("  Session disconnect prevention will NOT work");
     }
 
     // ================================================================
-    // STEP 4: Install Winsock hooks + server redirect
-    // ================================================================
-    LOG_INFO("[4/6] Installing Winsock hooks...");
-    Hooks::WinsockHooks::InstallHooks();
-
-    if (m_config.use_custom_server) {
-        LOG_INFO("[4/6] Setting up server redirect to %s:%u...",
-                 m_config.server_ip.c_str(), m_config.server_port);
-
-        // Configure the Winsock hook to redirect port 50031
-        Hooks::WinsockHooks::SetServerRedirect(m_config.server_ip, m_config.server_port);
-
-        // Find the public key file — check next to the DLL, then in server dir
-        std::string keyPath = "ds2_server_public.key";
-        {
-            std::ifstream testKey(keyPath);
-            if (!testKey.good()) {
-                testKey.clear();
-                keyPath = "Saved/default/public.key";
-                testKey.open(keyPath);
-            }
-            if (!testKey.good()) {
-                LOG_WARNING("[4/6] No public key file found — RSA patching will be skipped");
-                LOG_WARNING("[4/6] Place ds2_server_public.key in game folder for server auth");
-                // Still patch hostname in background thread (needs SteamStub wait)
-                std::string ip = m_config.server_ip;
-                CreateThread(nullptr, 0, [](LPVOID param) -> DWORD {
-                    auto* ipStr = static_cast<std::string*>(param);
-                    Hooks::ServerRedirect::PatchHostname(*ipStr);
-                    delete ipStr;
-                    return 0;
-                }, new std::string(ip), 0, nullptr);
-            } else {
-                testKey.close();
-                // Run hostname + RSA patching in a background thread
-                // (needs to wait for SteamStub to unpack)
-                std::string ip = m_config.server_ip;
-                std::string kp = keyPath;
-                CreateThread(nullptr, 0, [](LPVOID param) -> DWORD {
-                    auto* args = static_cast<std::pair<std::string, std::string>*>(param);
-                    Hooks::ServerRedirect::Install(args->first, args->second);
-                    delete args;
-                    return 0;
-                }, new std::pair<std::string, std::string>(ip, kp), 0, nullptr);
-            }
-        }
-    }
-
-    // ================================================================
-    // STEP 5: Install game state hooks (optional local event detection)
+    // STEP 4: Install game state hooks (optional local event detection)
     //
     // PlayerSync::Initialize() MUST run first so that g_itemGiveFunc is
     // resolved (AOB scan) before GameState::InstallHooks() tries to hook it.
     // Without this, the ItemGive hook would be deferred until the first
     // session join — missing all item pickups before that point.
     // ================================================================
-    LOG_INFO("[5/6] Pre-initializing PlayerSync (ItemGive AOB scan)...");
+    LOG_INFO("[4/5] Pre-initializing PlayerSync (ItemGive AOB scan)...");
     Sync::PlayerSync::GetInstance().Initialize();
 
-    LOG_INFO("[5/6] Installing game state hooks...");
+    LOG_INFO("[4/5] Installing game state hooks...");
     Hooks::GameState::InstallHooks();
 
     // ================================================================
-    // STEP 6: Initialize subsystems
+    // STEP 5: Initialize subsystems (Steamworks P2P — no port needed)
     // ================================================================
-    LOG_INFO("[6/6] Initializing subsystems...");
+    LOG_INFO("[5/5] Initializing subsystems...");
 
-    // Network manager (our P2P layer)
-    if (!Network::PeerManager::GetInstance().Initialize(m_config.port)) {
-        LOG_WARNING("  Network manager failed to initialize (can retry from menu)");
+    // Network manager (Steamworks P2P transport — no port)
+    if (!Network::PeerManager::GetInstance().Initialize()) {
+        LOG_WARNING("  Network manager failed to initialize (Steam not running?)");
     } else {
-        LOG_INFO("  Network manager ready (port %u)", m_config.port);
+        LOG_INFO("  Network manager ready (Steamworks P2P)");
     }
 
     // Session manager
@@ -218,14 +172,14 @@ bool SeamlessCoopMod::Initialize() {
     LOG_INFO("==========================================");
     LOG_INFO("SEAMLESS CO-OP INITIALIZATION COMPLETE");
     LOG_INFO("==========================================");
+    LOG_INFO("  Transport:          Steamworks P2P (no server required)");
     LOG_INFO("  Addresses resolved: %s", addressesFound ? "YES" : "NO");
     LOG_INFO("  Protobuf hooks:     %s", protobufHooked ? "ACTIVE" : "FAILED");
-    LOG_INFO("  Disconnect blocking: %s",
-             Hooks::ProtobufHooks::IsSeamlessActive() ? "ENABLED" : "DISABLED");
+    LOG_INFO("  Disconnect blocking: STANDBY (activates on session join)");
     LOG_INFO("");
     if (protobufHooked) {
         LOG_INFO("  Press INSERT to open co-op menu");
-        LOG_INFO("  Host a session or join via IP");
+        LOG_INFO("  Host or Join — same password on both sides");
         LOG_INFO("  Sessions persist through boss kills and deaths");
     } else {
         LOG_INFO("  Running in PASSIVE MODE (title bar indicator only)");
@@ -270,7 +224,6 @@ void SeamlessCoopMod::Shutdown() {
 
     // Unhook
     Hooks::ProtobufHooks::UninstallHooks();
-    Hooks::WinsockHooks::UninstallHooks();
     Hooks::GameState::UninstallHooks();
     Hooks::HookManager::GetInstance().Shutdown();
 
@@ -330,8 +283,6 @@ void SeamlessCoopMod::LoadConfig() {
                     m_config.debug_logging = (value == "true" || value == "1");
                 } else if (key == "max_players") {
                     m_config.max_players = static_cast<uint16_t>(std::stoi(value));
-                } else if (key == "port") {
-                    m_config.port = static_cast<uint16_t>(std::stoi(value));
                 } else if (key == "allow_invasions") {
                     m_config.allow_invasions = (value == "true" || value == "1");
                 } else if (key == "sync_bonfires") {
@@ -340,12 +291,8 @@ void SeamlessCoopMod::LoadConfig() {
                     m_config.sync_items = (value == "true" || value == "1");
                 } else if (key == "sync_enemies") {
                     m_config.sync_enemies = (value == "true" || value == "1");
-                } else if (key == "server_ip") {
-                    m_config.server_ip = value;
-                } else if (key == "server_port") {
-                    m_config.server_port = static_cast<uint16_t>(std::stoi(value));
-                } else if (key == "use_custom_server") {
-                    m_config.use_custom_server = (value == "true" || value == "1");
+                } else if (key == "session_password") {
+                    m_config.session_password = value;
                 }
             }
         }
@@ -364,20 +311,18 @@ void SeamlessCoopMod::LoadConfig() {
 void SeamlessCoopMod::SaveConfig() {
     std::ofstream configFile("ds2_seamless_coop.ini");
     if (configFile.is_open()) {
-        configFile << "# Dark Souls 2 Seamless Co-op Configuration\n\n";
+        configFile << "# Dark Souls 2 Seamless Co-op Configuration\n";
+        configFile << "# Transport: Steamworks P2P (no server setup needed)\n\n";
         configFile << "enabled=true\n";
         configFile << "debug_logging=" << (m_config.debug_logging ? "true" : "false") << "\n";
         configFile << "max_players=" << m_config.max_players << "\n";
-        configFile << "port=" << m_config.port << "\n";
+        configFile << "\n# Session — same password on host and joiner, then press INSERT\n";
+        configFile << "session_password=" << m_config.session_password << "\n";
         configFile << "\n# Sync settings\n";
         configFile << "allow_invasions=" << (m_config.allow_invasions ? "true" : "false") << "\n";
-        configFile << "sync_bonfires=" << (m_config.sync_bonfires ? "true" : "false") << "\n";
-        configFile << "sync_items=" << (m_config.sync_items ? "true" : "false") << "\n";
-        configFile << "sync_enemies=" << (m_config.sync_enemies ? "true" : "false") << "\n";
-        configFile << "\n# Custom server settings\n";
-        configFile << "use_custom_server=" << (m_config.use_custom_server ? "true" : "false") << "\n";
-        configFile << "server_ip=" << m_config.server_ip << "\n";
-        configFile << "server_port=" << m_config.server_port << "\n";
+        configFile << "sync_bonfires="   << (m_config.sync_bonfires   ? "true" : "false") << "\n";
+        configFile << "sync_items="      << (m_config.sync_items      ? "true" : "false") << "\n";
+        configFile << "sync_enemies="    << (m_config.sync_enemies    ? "true" : "false") << "\n";
         configFile.close();
     }
 }
