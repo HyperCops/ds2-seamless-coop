@@ -5,37 +5,52 @@ Mod DLL pour Dark Souls 2: Scholar of the First Sin (Steam, x64) qui rend le co-
 
 ---
 
-## Architecture en un coup d'œil
+## Architecture actuelle (Yui-style, pivot Mai 2026)
+
+**Principe** : on hook la session native de DS2 — zéro transport custom. Le jeu gère lui-même les positions/animations via son propre networking Steam. On se contente de :
+1. Garder la session vivante (bloquer les messages de déconnexion)
+2. Découverte par mot de passe via Steam lobbies
+3. *(à venir)* Appeler SpawnPhantom automatiquement quand un joueur rejoint
 
 ```
 dinput8.dll  (proxy DirectInput, chargé par DS2 au boot)
     └── DllMain → SeamlessCoopMod::Initialize()
           1. MinHook init
           2. AOB scan (GameManagerImp, NetSessionManager)
-          3. Protobuf hooks  ← bloc les disconnect messages (mécanisme core)
-          4. Winsock hooks + server redirect
-          5. PlayerSync::Initialize() (AOB ItemGive) → GameState::InstallHooks()
-          6. Network / Session / UI subsystems + update thread @20Hz
+          3. Protobuf hooks  ← bloque disconnect messages (mécanisme core)
+          4. GameState::InstallHooks() (SetEventFlag, ItemGive)
+          5. SessionManager + UI subsystems + update thread @20Hz
 ```
+
+**Ce qui a été supprimé** (ancienne archi custom P2P) :
+- `network_hooks.cpp` — WinsockHooks, ServerRedirect (supprimé du build)
+- Transport custom : peer_manager, packet_handler, crypto, position sync via paquets
+- Session codes (DS2-base64), champ IP, port, server_ip dans la config
 
 ---
 
-## Fichiers clés — ce qu'ils font
+## Fichiers clés
 
 | Fichier | Rôle |
 |---|---|
 | `include/addresses.h` | Tous les AOB patterns + offsets mémoire DS2 |
-| `include/network.h` | PacketType enum + structs de paquets |
-| `include/sync.h` | Déclarations PlayerSync / ProgressSync |
 | `include/hooks.h` | HookManager, ProtobufHooks, GameState |
+| `include/session.h` | SessionManager (Steam lobbies async) |
 | `include/ui.h` | Overlay (INSERT menu) + TitleScreenNotifier |
 | `src/core/mod.cpp` | Init/Shutdown + LoadConfig |
-| `src/hooks/game_state_hooks.cpp` | SetEventFlag hook, ItemGive hook, HookManager impl |
-| `src/sync/player_sync.cpp` | Position/HP/souls sync, zone transition detection, TeleportToHost |
-| `src/sync/progress_sync.cpp` | Boss kills, event flags, souls, items, zone transition broadcast |
-| `src/network/packet_handler.cpp` | Routing des paquets reçus → subsystems |
-| `src/ui/overlay.cpp` | INSERT menu, session codes, player HUD (toujours visible) |
-| `launcher/installer_gui.cpp` | Installeur GUI Win32 (détecte DS2, copie DLL) |
+| `src/hooks/game_state_hooks.cpp` | SetEventFlag hook, ItemGive hook |
+| `src/session/session_manager.cpp` | Steam lobby create/join par mot de passe |
+| `src/ui/overlay.cpp` | INSERT menu simplifié (Host / Join par password) |
+| `third_party/steamworks/steam_minimal.h` | SDK Steam minimal (vtable manuelle) |
+
+---
+
+## Steam Lobbies — fonctionnement
+
+- **Hôte** : `SteamMM::CreateLobby` → `SetLobbyData("ds2coop_pw", password)`
+- **Rejoignant** : `AddRequestLobbyListStringFilter("ds2coop_pw", password, Equal)` → `RequestLobbyList` → `JoinLobby`
+- Polling async dans `SessionManager::Update()` (pas de callbacks SteamAPI)
+- `SteamAPI::RunCallbacks()` appelé à chaque Update
 
 ---
 
@@ -45,24 +60,13 @@ dinput8.dll  (proxy DirectInput, chargé par DS2 au boot)
 GameManagerImp (GMI) = AOB scan
 GMI + 0x38  → PlayerData ptr
 GMI + 0x60  → EventFlagManager ptr
-GMI + 0xD0  → PlayerCtrl ptr
-GMI + 0xA8  → GameDataManager ptr (nom du personnage)
 
-PlayerData + 0x30  → float X
-PlayerData + 0x34  → float Y
-PlayerData + 0x38  → float Z
 PlayerData + 0x3C  → int32 HP (current)
 PlayerData + 0x40  → int32 MaxHP
-PlayerData + 0xF0  → int32 Souls (dépensables)
+PlayerData + 0xF0  → int32 Souls
 PlayerData + 0xF4  → uint32 SoulMemory
 PlayerData + 0x16C → uint32 LastBonfire ID
 PlayerData + 0xD0  → uint32 Level
-
-PlayerCtrl + 0x168 → int32 HP (current) — source fiable
-PlayerCtrl + 0x170 → int32 MaxHP        — source fiable
-
-EventFlagManager + 0x20 → uint32[] bitfield
-  flag bit = bitfield[flagId >> 5] & (1 << (flagId & 31))
 
 NetSessionManager + 0x18 → SessionPtr
 NetSessionManager + 0x20 → PlayerPtr
@@ -72,7 +76,7 @@ PlayerPtr  + 0x1F4 → uint32 phantom field (0 = host perms)
 
 ---
 
-## AOB Patterns (dans addresses.h)
+## AOB Patterns
 
 | Pattern | Statut |
 |---|---|
@@ -82,65 +86,70 @@ PlayerPtr  + 0x1F4 → uint32 phantom field (0 = host perms)
 | `ProtobufParse` | ✅ Vérifié (ds3os) |
 | `SetEventFlag` | ✅ Pattern écrit, à vérifier en jeu |
 | `ItemGive` | ✅ Pattern (DS2S-META), à vérifier en jeu |
-| `BonfireWarp` | ❌ Pattern vide — TODO Cheat Engine |
+| `BonfireWarp` | ❌ Pattern vide — TODO CE |
+| `SpawnPhantom` | ❌ Pas encore trouvé — voir section CE ci-dessous |
 
 ---
 
-## Paquets réseau (PacketType enum)
+## CE Findings — session 2026-05-02
 
-```
-0x01 Handshake       0x20 PlayerPosition   0x30 BossDefeated
-0x02 Disconnect      0x21 PlayerAction     0x31 BonfireRest
-0x03 Heartbeat       0x22 PlayerState      0x33 ItemPickup
-0x10 SessionCreate   0x23 PlayerDeath      0x34 EventFlag
-0x11 SessionJoin     0x24 PlayerRespawn    0x35 SoulsGranted
-0x12 SessionLeave                          0x36 ZoneTransition
-```
+### Adresses trouvées
 
-PacketHeader (21 bytes packed) : `uint32 magic(DS2C) | uint8 type | uint32 size | uint32 seq | uint64 ts`
+| Adresse | Rôle |
+|---|---|
+| `DarkSoulsII.exe+0x51B272` | Instruction qui charge le NetSessionManager (MOV RCX,[RIP+x]) |
+| `DarkSoulsII.exe+0x2C71B0` | Thunk vtable appelé depuis le gestionnaire de session |
+| `DarkSoulsII.exe+0x16A4865` | **Slot fantôme flag 0** : 0→1 au spawn, 1→0 au départ |
+| `DarkSoulsII.exe+0x16A4899` | **Slot fantôme flag 1** : idem (slot 2 ou champ lié) |
+
+### Thunk à +0x2C71B0 (décodé)
+```asm
+push rdi
+sub rsp, 20h
+mov rdi, rcx          ; save 'this'
+mov rcx, [rcx+0x40]   ; charge sous-objet à offset 0x40
+test rcx, rcx
+jz +F                 ; null check
+mov rax, [rcx]        ; vtable
+add rsp, 20h
+pop rdi
+jmp [rax+0x90]        ; → vtable slot 18
+```
+= dispatche `this->field_0x40->vtable[18]()`
+
+### SpawnPhantom — à trouver
+
+**Méthode** (avec un ami ou PNJ invocable) :
+1. CE → First Scan, Value Type = `Byte`, valeur = `0` (fantôme absent)
+2. Invoquer le fantôme → Next Scan valeur = `1`
+3. Répéter 2-3 cycles → isoler `+0x16A4865` et `+0x16A4899`
+4. Clic droit → **"Find out what ACCESSES this address"** (VEH Debugger activé)
+5. Invoquer à nouveau → CE montre l'instruction → remonter au début de la fonction
+6. Noter les 16 premiers bytes du prologue → c'est SpawnPhantom
+
+**Une fois trouvé** : appeler depuis `SessionManager::Update()` quand `m_state` passe à `Connected`.
 
 ---
 
 ## Fonctionnalités — état actuel
 
 ### ✅ Implémenté
-- Protobuf hooks (bloc disconnect → session persistante)
-- Position sync @20Hz
-- HP/stamina/level sync @2Hz
-- Souls sync (delta, seuil=1, toute augmentation partagée)
-- Boss kill sync (SetEventFlag hook → BossDefeatedPacket → ApplyEventFlagToMemory)
-- Item pickup sync (ItemGive hook → ItemPickupPacket)
-- Bonfire sync (état "allumé" écrit dans la save des pairs)
-- Zone transition detection (LastBonfire + position jump > 50u)
-- ZoneTransitionPacket broadcast + ExecuteBonfireWarp (fallback notification)
-- Emergency teleport (TeleportToHost, cooldown 10s)
-- Player HUD 2D toujours visible (noms + HP bars, style Yui)
-- Session codes (DS2-<base64> encodant IP:port:password)
-- Installeur GUI Win32 (détection Steam registry, backup vanilla DLL)
-- Config INI (enabled, max_players, port, sync_*, server_*)
+- Protobuf hooks (bloc disconnect → session persistante à travers morts/boss/warp)
+- Steam lobby discovery par mot de passe (CreateLobby / RequestLobbyList / JoinLobby)
+- SetEventFlag hook (boss kills détectés localement)
+- ItemGive hook
+- Player HUD 2D (noms + HP bars, style Yui)
+- Overlay simplifié (INSERT → Host/Join par password, pas d'IP)
+- Config INI minimale (session_password, sync_bonfires, etc.)
 
 ### ❌ Pas encore fait
-- BonfireWarp AOB (à trouver avec CE pour le zone sync automatique)
-- Emergency teleport cross-zone (actuellement same-zone only)
-- Noms de personnages au-dessus des joueurs en 3D world space
+- **SpawnPhantom** : auto-invoquer sans soapstone quand lobby rejoint ← PRIORITÉ #1
+- **BonfireWarp AOB** : warp cross-zone automatique
+- Nettoyer peer_manager / packet_handler / crypto du build (supprimés de la logique mais fichiers encore présents)
 
 ### ⏳ Décidé de ne pas faire
-- Fog gate sync (chaque joueur passe quand il veut)
-
----
-
-## Globals cross-TU importants
-
-```cpp
-// player_sync.cpp — extern dans game_state_hooks.cpp et progress_sync.cpp
-void* g_itemGiveFunc    = nullptr;  // void* pour éviter type mismatch cross-TU
-bool  g_itemGiveScanned = false;
-bool  g_ourItemGiveCall = false;    // guard anti-reboucle ItemGive hook
-
-// progress_sync.cpp — interne
-static void* g_bonfireWarpFunc    = nullptr;
-static bool  g_bonfireWarpScanned = false;
-```
+- Transport custom (positions, HP via paquets) — le jeu gère ça nativement
+- Fog gate sync
 
 ---
 
@@ -150,36 +159,11 @@ static bool  g_bonfireWarpScanned = false;
 // player_sync.cpp::Initialize()
 PatchPhantomDismissalLoops()  // NOP 2 CALLs dans FUN_140191bb0
                                // exe+0x191c87 et exe+0x191d17
-                               // Evite que les boss kills renvoient les phantoms
+                               // Évite que les boss kills renvoient les phantoms
 
 PatchPlayerCap()               // exe+0x6ab0b9 : 0x03 → max_players (config)
                                // exe+0x6ab15e : pareil dans le protobuf
 ```
-
----
-
-## Session codes (overlay)
-
-Format : `DS2-` + Base64(`"IP:PORT:password"`)
-Exemple : `DS2-ODUuMjMuMTE0Ljc6MjcwMTU6Y29vcA==`
-
-- L'hôte voit ses codes dès qu'il tape un mot de passe (avant même de cliquer Start Hosting)
-- Le guest colle le code dans Join → champ "Session Code" → Connect with Code
-- Fallback : champs IP + password manuels toujours disponibles
-
----
-
-## Erreurs de compilation connues (non corrigées à ce jour)
-
-### game_state_hooks.cpp
-- **C2712** ligne ~72 : `__try` dans fonction avec objets C++ → isoler dans sous-fonction SEH pure
-- **C2653/C2065** ligne ~170 : `Network::ItemPickupPacket` — manque `#include "../../include/network.h"`
-
-### progress_sync.cpp  
-- **C2712** ligne ~441 : même problème `__try` + objets C++
-
-### player_sync.cpp
-- **C2065** lignes 279-280-286 : `g_itemGiveScanned` / `g_itemGiveFunc` utilisés avant leur définition → ajouter déclarations forward en haut du fichier
 
 ---
 
@@ -190,106 +174,22 @@ Exemple : `DS2-ODUuMjMuMTE0Ljc6MjcwMTU6Y29vcA==`
 - Memory reads/writes : `Memory::Read<T>(addr, &val)` / `Memory::Write<T>(addr, val)`
 - Hooks via MinHook : `HookManager::GetInstance().InstallHook(target, detour, &original)`
 - AOB scans : `PatternScanner::FindPattern(pattern, mask, nullptr)`
-- Paquets : toujours `header.magic = 0x44533243` ('DS2C')
-- `__try/__except` : **ne pas mettre dans des fonctions qui ont des objets C++ avec destructeurs** (C2712 MSVC)
-- Globals cross-TU : utiliser `void*` plutôt que des typedefs de pointeurs de fonctions pour éviter les incompatibilités de types
+- `__try/__except` : ne pas mettre dans des fonctions avec objets C++ (C2712 MSVC)
+- Steam SDK : vtable manuelle via `SteamVCall<Ret>(iface, slot, args...)` (SDK 2013)
 
 ---
 
-## Session Cheat Engine — AOB à trouver (prochaine session)
+## Config INI (dist/)
 
-### Contexte
-Le jeu est DS2 Scholar of the First Sin (Steam, x64, v1.02).
-Le mod est chargé via `dinput8.dll` dans le dossier du jeu.
-Les patterns trouvés vont dans `include/addresses.h`.
-
----
-
-### 1. BonfireWarp — PRIORITÉ HAUTE
-**Pourquoi** : permet le warp automatique cross-zone quand l'hôte se déplace.
-Sans ça, `ExecuteBonfireWarp()` affiche juste une notification sans téléporter.
-
-**Comment trouver :**
-1. Ouvrir CE, attacher à `DarkSoulsII.exe`
-2. Menu CE : `Memory View → Add address manually` → adresse = `GameManagerImp + 0x38` (PlayerData), puis `+ 0x16C` (LastBonfire)
-3. Poser un **breakpoint on write** sur cette adresse (clic droit → `Find out what writes to this address`)
-4. En jeu : aller à un feu de camp → choisir **Warp** vers une autre zone
-5. CE s'arrête sur l'instruction qui écrit LastBonfire
-6. Dans le call stack (bas de la fenêtre) remonter jusqu'à la fonction qui a initié le warp
-7. Aller à cette fonction dans Memory View → noter les **8-16 premiers bytes du prologue**
-8. Copier l'adresse → `exe+0xXXXXXX` (adresse relative à la base du module)
-
-**Où mettre le résultat** dans `include/addresses.h` :
-```cpp
-constexpr AOBPattern BONFIRE_WARP = {
-    "BonfireWarp",
-    "\xXX\xXX\xXX...",   // bytes du prologue
-    "xxxxxxxx...",        // masque (x = vérifié, ? = wildcard)
-    0, 0
-};
-constexpr uint32_t WARP_MGR_FROM_GMI = 0xXX; // offset depuis GMI vers le warp manager
+```ini
+enabled=true
+debug_logging=false
+max_players=6
+session_password=coop
+allow_invasions=false
+sync_bonfires=true
+sync_items=false
+sync_enemies=false
 ```
 
-**Vérification** : `ExecuteBonfireWarp()` dans `progress_sync.cpp` scanne ce pattern au premier appel.
-
----
-
-### 2. Matrice caméra (ViewProjection) — PRIORITÉ MOYENNE
-**Pourquoi** : permet d'afficher les noms des joueurs au-dessus de leur personnage à l'écran (projection 3D → 2D).
-
-**Comment trouver :**
-1. Dans CE, chercher les floats de la matrice 4x4 (16 floats)
-2. La matrice VP contient des valeurs comme `[0]` ≈ cot(FOV/2) / aspect_ratio, `[5]` ≈ cot(FOV/2)
-3. Méthode : chercher la valeur `cot(45°)` ≈ `1.0` ou `cot(60°/2)` ≈ `1.732` dans les floats
-4. Filtrer par "changed by code" pendant un mouvement de caméra
-5. Trouver le pointeur statique qui pointe vers ce bloc de 64 bytes
-
-**Alternative plus simple** : chercher dans les constant buffers DX11 via un outil comme RenderDoc (capturer une frame → chercher le cbuffer qui contient la VP matrix).
-
-**Où mettre le résultat** dans `include/addresses.h` :
-```cpp
-constexpr AOBPattern CAMERA_VP_MATRIX = {
-    "CameraVPMatrix",
-    "\xXX\xXX...",
-    "xxxx...",
-    3, 7  // RIP-relative pointer
-};
-```
-
----
-
-### 3. SpawnWorldItem — PRIORITÉ BASSE
-**Pourquoi** : permet de synchroniser les drops d'items au sol (échange entre joueurs).
-
-**Comment trouver :**
-1. En jeu : équiper un item → le lâcher au sol (bouton drop dans l'inventaire)
-2. Dans CE : poser un breakpoint sur les writes à la zone d'inventaire (PlayerData + 0x12EC)
-3. Remonter le call stack jusqu'à la fonction qui crée l'entité world item
-4. Son prologue = pattern à noter
-
-**Note** : cette fonction est complexe (crée une entité physique dans le monde).
-Vérifier la signature avant d'implémenter : elle prend probablement (WorldManager*, itemId, category, x, y, z, quantity).
-
----
-
-### Workflow après avoir trouvé un pattern
-1. Copier les bytes du prologue de la fonction (Memory View → sélectionner ~16 bytes → clic droit → Copy → Hex)
-2. Renseigner dans `include/addresses.h` l'AOBPattern correspondant
-3. Compiler (`cmake --build build --config Release`)
-4. Tester en jeu
-5. Committer avec `git commit -m "Add BonfireWarp AOB pattern (verified in-game)"`
-
----
-
-## Fichiers de test
-
-```
-DS2_Seamless_Coop/test_client.py       — faux client Python (simule un 2e joueur en local)
-DS2_Seamless_Coop/DS2CoopInstaller_Preview.ps1  — aperçu PS1 de l'installeur GUI
-```
-
-Usage test client :
-```
-python test_client.py --password test --name "MonPote"
-# Commandes : p=position, h=HP, b=boss, s=souls, z=zone, d=death, q=quit
-```
+Même fichier pour hôte ET rejoignant. Pas d'IP, pas de port, pas de serveur.

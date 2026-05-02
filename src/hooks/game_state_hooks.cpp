@@ -20,6 +20,7 @@
 //      (does NOT call SetEventFlag, avoiding a broadcast loop)
 
 #include "../../include/hooks.h"
+#include "../../include/mod.h"
 #include "../../include/sync.h"
 #include "../../include/session.h"
 #include "../../include/utils.h"
@@ -163,6 +164,10 @@ static void __fastcall ItemGiveHook(void* bag, void* items, int count, int mode)
 
     // Only broadcast when a co-op session is active
     if (!DS2Coop::Hooks::ProtobufHooks::IsSeamlessActive()) return;
+
+    // Respect sync_items=false in config — hook stays installed (needed for
+    // our own ItemGive calls) but we never broadcast when sync is disabled.
+    if (!DS2Coop::SeamlessCoopMod::GetInstance().GetConfig().sync_items) return;
 
     // Safety: items pointer must be valid and count reasonable
     if (!items || count <= 0 || count > 64) return;

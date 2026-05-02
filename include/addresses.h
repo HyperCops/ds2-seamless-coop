@@ -347,5 +347,40 @@ constexpr AOBPattern BONFIRE_WARP = {
 // Currently assumes the warp function's first arg is obtainable from GMI.
 constexpr uint32_t WARP_MGR_FROM_GMI = 0x00;   // TODO: verify
 
+// ============================================================================
+// PHANTOM SLOT FLAGS — trouvés via CE scan dynamique (invocation de Luet le
+// Mercenaire, Forest of Fallen Giants, DS2 SotFS x64 v1.02)
+//
+// Ces deux adresses passent de 0 à 1 quand un fantôme (PNJ ou joueur) spawn,
+// et de 1 à 0 quand il quitte / meurt.
+//
+// Utilisation prévue :
+//   - Poser un "Find what writes to this address" en jeu pour remonter à
+//     SpawnPhantom (la fonction native DS2 qui initie le spawn)
+//   - Une fois SpawnPhantom trouvé, l'appeler depuis SessionManager::Update()
+//     quand un joueur rejoint le lobby Steam → invocation automatique sans soapstone
+//
+// Statut : adresses statiques confirmées, SpawnPhantom pas encore trouvé
+// ============================================================================
+namespace PhantomSlots {
+    constexpr uint32_t SLOT_FLAG_0 = 0x16A4865;  // 0→1 au spawn, 1→0 au départ
+    constexpr uint32_t SLOT_FLAG_1 = 0x16A4899;  // idem (slot 2 ou champ lié)
+}
+
+// ============================================================================
+// CE FINDINGS — session de reverse engineering 2026-05-02
+//
+// NetSessionManager reference : DarkSoulsII.exe+0x51B272
+//   Instruction : 48 8B 0D [RIP+offset] 48 85 C9 74 ?? 48 8B 49 18 E8
+//   Le CALL à la fin (E8) pointe vers un thunk vtable à :
+//
+// Thunk vtable : DarkSoulsII.exe+0x2C71B0
+//   Code :  push rdi / sub rsp,20 / mov rdi,rcx
+//           mov rcx,[rcx+0x40] / test rcx,rcx / jz +F
+//           mov rax,[rcx] / add rsp,20 / pop rdi
+//           jmp [rax+0x90]   ; → vtable slot 18 du sous-objet à offset 0x40
+//   = dispatche vers this->field_0x40->vtable[18]()
+// ============================================================================
+
 } // namespace Addresses
 } // namespace DS2Coop

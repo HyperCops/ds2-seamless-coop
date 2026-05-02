@@ -1,103 +1,131 @@
 # Dark Souls 2: Seamless Co-op
 
-Play through the entirety of Dark Souls 2: Scholar of the First Sin with friends. Boss kills, deaths, bonfires, area transitions — nothing disconnects you. One summon, the whole game.
+Mod pour Dark Souls 2: Scholar of the First Sin permettant de jouer en co-op persistant avec des amis. Basé sur l'interception protobuf (technique ds3os) et un serveur privé [ds3os](https://github.com/TLeonardUK/ds3os).
 
-> **Work in progress** — core systems implemented, actively being tested.
+> **Work in progress** — connexion fonctionnelle, synchronisation en cours de développement.
 
-## Features
+---
 
-| Fonctionnalité | État |
-|---|---|
-| Session persistante (boss kills, morts, bonfires) | ✅ |
-| Sync position / HP / stamina / level | ✅ 20 Hz / 2 Hz |
-| Sync âmes (boss kills partagés) | ✅ |
-| Sync boss kills (event flags) | ✅ |
-| Sync items ramassés | ✅ |
-| Sync zones / écrans de chargement | ✅ |
-| HUD joueurs toujours visible (noms + barres HP) | ✅ |
-| Codes de session (copier-coller, pas d'IP à taper) | ✅ |
-| Téléportation d'urgence sur l'hôte | ✅ |
-| Installeur graphique (détecte DS2 auto via Steam) | ✅ |
-| Augmentation du cap joueurs (jusqu'à 6) | ✅ |
-| Timer fantôme infini | ✅ |
-| Warp automatique quand l'hôte change de zone | ⏳ (AOB manquant) |
-| Noms 3D flottants | ❌ non prévu |
-| Sync fog gates | ❌ non prévu |
+## État actuel (honnête)
+
+| Fonctionnalité | État | Notes |
+|---|---|---|
+| Connexion P2P (codes de session) | ✅ | Handshake chiffré AES-256-GCM |
+| HUD joueurs (noms + barres HP) | ✅ | Toujours visible |
+| Codes de session copier-coller | ✅ | Format `DS2-xxxx` |
+| Augmentation cap joueurs (6 max) | ✅ | Patch mémoire runtime |
+| Timer fantôme infini | ✅ | Patch mémoire runtime |
+| Serveur privé (ds3os) | ✅ | Requis — voir configuration |
+| Session persistante (boss kills) | ⚠️ | Nécessite ds3os actif côté hôte |
+| Sync position / HP | ⚠️ | P2P uniquement, phantom natif DS2 |
+| Sync boss kills (event flags) | ⚠️ | SetEventFlag non trouvé sur certains builds |
+| Convocation directe sans signe | ❌ | En développement (nécessite RE Ghidra) |
+| Apparence joueur solide (non fantôme) | ❌ | En développement (CharacterManager) |
+| Drop d'items entre joueurs | ❌ | En développement |
+| Warp automatique cross-zone | ❌ | AOB BonfireWarp non trouvé |
+
+---
+
+## Prérequis
+
+- Dark Souls 2: Scholar of the First Sin (Steam, x64, v1.03)
+- Windows 10 / 11
+- [Hamachi](https://vpn.net) ou [ZeroTier](https://zerotier.com) (recommandé pour la connexion)
+
+---
 
 ## Installation
 
-### Via l'installeur (recommandé)
+### Hôte (celui qui héberge la partie)
 
-1. Télécharge `DS2SeamlessCoopInstaller.exe` et `dinput8.dll` depuis les [Releases](../../releases/latest)
-2. Lance `DS2SeamlessCoopInstaller.exe` — il détecte DS2 automatiquement
-3. Clique **Installer le mod**, puis **Lancer DS2 via Steam**
-
-### Manuellement
-
-1. Copie `dinput8.dll` dans le dossier du jeu :
+1. Copie le contenu de `dist/host/` dans le dossier du jeu :
    ```
    Steam\steamapps\common\Dark Souls II Scholar of the First Sin\Game\
    ```
-2. Lance DS2 normalement via Steam — le mod se charge automatiquement
-3. Pour désinstaller : supprime `dinput8.dll` (l'installeur restaure le backup automatiquement)
+   Fichiers : `dinput8.dll`, `ds2_seamless_coop.ini`, `ds2_server_public.key`
 
-## Comment jouer
+2. **Avant de lancer DS2**, démarre le serveur :
+   ```
+   dist/host/StartServer.bat
+   ```
 
-1. Lance DS2, appuie sur **INSERT** pour ouvrir le menu co-op
-2. **Hôte :** Tape un mot de passe → clique **Start Hosting** → copie le **code de session** (ex: `DS2-ODUu...`)
-3. **Joueur :** Colle le code dans le champ **Session Code** → clique **Connect with Code**
-4. C'est tout — les soapstones sont accordées automatiquement
+3. Lance DS2 — le mod se charge automatiquement (title bar modifiée).
 
-## Connexion avec des amis
+4. Appuie sur **INSERT** → **Start Hosting** → note le code de session.
 
-| Situation | Solution |
-|---|---|
-| Même réseau local | Code LAN affiché dans le menu hôte |
-| Internet (port forwarding) | Code Internet — l'hôte ouvre le port **UDP 27015** |
-| Sans port forwarding | [Hamachi](https://vpn.net) ou [ZeroTier](https://zerotier.com) → code LAN du réseau VPN |
+### Joueur (celui qui rejoint)
 
-Les IPs sont masquées par défaut (mode streamer). Le code de session encode l'IP — rien à taper manuellement.
+1. Copie le contenu de `dist/joiner/` dans le dossier du jeu :
+   ```
+   Steam\steamapps\common\Dark Souls II Scholar of the First Sin\Game\
+   ```
+
+2. Dans `ds2_seamless_coop.ini`, change `server_ip` pour l'IP Hamachi de l'hôte.
+
+3. Lance DS2 → **INSERT** → **Join** → colle le code de session → **Connect**.
+
+4. Utilise ensuite la **White Sign Soapstone** pour te convoquer dans le monde de l'hôte.
+
+> **Note :** La convocation native DS2 (pierre de savon) est encore requise pour apparaître en jeu. Une convocation directe sans signe est en développement.
+
+---
 
 ## Comment ça marche
 
-Le mod intercepte la couche protobuf du jeu pour bloquer les messages de déconnexion. Quand le jeu tente de terminer la session co-op (boss kill, mort, transition), le message est silencieusement supprimé. Technique identique à celle de [ds3os](https://github.com/TLeonardUK/ds3os) et du Seamless Co-op de LukeYui pour Elden Ring.
+Le mod agit sur deux couches :
 
-En plus du hook protobuf :
-- **Hook SetEventFlag** : détecte les boss kills locaux et les broadcast aux pairs via UDP
-- **AOB scan** : localise ItemGive, SetEventFlag, GameManagerImp sans offset hardcodé
-- **Patches mémoire** : NOP des CALLs de renvoi de fantômes, augmentation du cap joueurs
-- **dinput8 proxy** : chargement automatique par DS2 au démarrage, pas de launcher
+**1. Couche P2P (port UDP 27015)**
+Connexion directe entre joueurs — synchronise position, HP, âmes, boss kills. Indépendant des serveurs FromSoftware.
 
-## Compatibilité
+**2. Couche session DS2 (ds3os)**
+Le serveur privé ds3os remplace les serveurs FromSoftware. Il ne génère pas de message "retour du fantôme" lors des boss kills, ce qui maintient la session active.
 
-- Dark Souls 2: Scholar of the First Sin (Steam, x64)
-- Windows 10 / 11
-- Ver 1.03, Calibrations 2.02
+Les hooks protobuf (technique ds3os) bloquent les messages de déconnexion côté client. Patches mémoire runtime : NOP des CALLs de renvoi de fantôme, augmentation du cap joueurs de 3 à 6.
 
-## Build depuis les sources
+---
 
-Prérequis : Visual Studio 2022 (workload "Desktop C++"), CMake 3.20+
+## Configuration (`ds2_seamless_coop.ini`)
 
-```bash
-git clone https://github.com/HyperCops/ds2-seamless-coop.git
-cd ds2-seamless-coop
-# Ouvrir dans Visual Studio → CMake détecté automatiquement
-# Build → Build All
-# Résultat dans dist/
+```ini
+# Hôte
+use_custom_server=true
+server_ip=127.0.0.1    # 127.0.0.1 pour l'hôte, IP Hamachi de l'hôte pour le joueur
+
+# Joueur
+use_custom_server=true
+server_ip=25.x.x.x     # IP Hamachi de l'hôte
 ```
 
-## Tester sans second PC
+---
 
-Un client Python simule un second joueur en local :
+## Tester sans second PC
 
 ```bash
 python test_client.py --password test --name "MonPote"
 # p = position  h = HP  b = boss  s = âmes  z = zone  q = quitter
 ```
 
+---
+
+## Build depuis les sources
+
+Prérequis : Visual Studio 2022+ (workload "Desktop C++"), CMake 3.20+
+
+```bash
+git clone https://github.com/HyperCops/ds2-seamless-coop.git
+cd ds2-seamless-coop
+# Ouvrir dans Visual Studio → CMake détecté automatiquement
+# Ou en ligne de commande (depuis un VS Developer Command Prompt) :
+cmake -S . -B build -G "NMake Makefiles" -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+# Résultat dans dist/
+```
+
+---
+
 ## Crédits
 
-- [ds3os](https://github.com/TLeonardUK/ds3os) — technique d'interception protobuf
+- [ds3os](https://github.com/TLeonardUK/ds3os) — technique d'interception protobuf + serveur privé
 - [LukeYui](https://github.com/LukeYui) — inspiration (Seamless Co-op DS1/DS3/ER)
 - [Dear ImGui](https://github.com/ocornut/imgui) — UI overlay
 - [MinHook](https://github.com/TsudaKagewortu/minhook) — function hooking

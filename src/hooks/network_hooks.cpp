@@ -51,6 +51,23 @@ static int WSAAPI ConnectHook(SOCKET s, const sockaddr* name, int namelen) {
 
         LOG_INFO("[NET] Game connecting to %s:%u", ipStr, port);
 
+        // Block the HTTP health-check that DS2 sends at boot to Cloudflare/Bandai (port 80).
+        // We only block routable (public) IPs — localhost, LAN, and Hamachi (25.x / 5.x)
+        // pass through so that our own public-IP fetch (api.ipify.org) and LAN tools work.
+        if (g_redirectActive && port == 80) {
+            uint32_t ip4 = ntohl(addr->sin_addr.s_addr);
+            bool isLocal   = ((ip4 >> 24) == 127);
+            bool isLAN192  = ((ip4 >> 16) == ((192 << 8) | 168));
+            bool isLAN10   = ((ip4 >> 24) == 10);
+            bool isLAN172  = ((ip4 >> 24) == 172) && (((ip4 >> 16) & 0xFF) >= 16) && (((ip4 >> 16) & 0xFF) <= 31);
+            bool isHamachi = ((ip4 >> 24) == 25) || ((ip4 >> 24) == 5);
+            if (!isLocal && !isLAN192 && !isLAN10 && !isLAN172 && !isHamachi) {
+                LOG_INFO("[NET] Blocking HTTP check to %s:80 — custom server active", ipStr);
+                WSASetLastError(WSAECONNREFUSED);
+                return SOCKET_ERROR;
+            }
+        }
+
         // Redirect all game server connections (login=50031, auth=50000, game=50010+)
         if (g_redirectActive && (port == DS2_LOGIN_PORT || port == 50000 ||
             (port >= 50010 && port <= 50100))) {

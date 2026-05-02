@@ -241,7 +241,7 @@ static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* swapChain, UINT s
 
         g_imguiInitialized = true;
         LOG_INFO("ImGui initialized on DX11 device (%ux%u)", g_rtvWidth, g_rtvHeight);
-        Overlay::GetInstance().ShowNotification("Seamless Co-op loaded  |  INSERT to open menu", 5.0f);
+        Overlay::GetInstance().ShowNotification("Seamless Co-op loaded  |  Press INSERT to connect", 5.0f);
     }
 
     // If RTV was released by ResizeBuffers hook, rebuild it
@@ -255,7 +255,7 @@ static HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* swapChain, UINT s
 
     static bool insertWasDown = false;
     bool insertDown = (GetAsyncKeyState(VK_INSERT) & 0x8000) != 0;
-    if (insertDown && !insertWasDown) overlay.Toggle();
+    if (insertDown && !insertWasDown) overlay.OnInsertPressed();
     insertWasDown = insertDown;
 
     ImGui_ImplDX11_NewFrame();
