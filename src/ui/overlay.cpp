@@ -263,6 +263,11 @@ Overlay& Overlay::GetInstance() {
 
 void Overlay::Initialize() {
     if (m_initialized) return;
+    // Pre-fill password from config so user doesn't have to type it again
+    const auto& cfg = DS2Coop::SeamlessCoopMod::GetInstance().GetConfig();
+    if (!cfg.session_password.empty()) {
+        strncpy_s(m_inputPassword, cfg.session_password.c_str(), sizeof(m_inputPassword) - 1);
+    }
     // Actual ImGui init happens in renderer.cpp when Present is first called
     m_initialized = true;
     LOG_INFO("Overlay initialized");
@@ -344,19 +349,18 @@ void Overlay::RenderMainMenu() {
     if (inSession) {
         auto players = sessionMgr.GetPlayers();
 
-        ImGui::TextDisabled("Session Active");
+        ImGui::TextColored(ImVec4(0.3f, 0.95f, 0.4f, 1.0f), "Mode seamless ACTIF");
+        ImGui::TextDisabled("Les deconnexions sont bloquees.");
         ImGui::Separator();
 
-        uint64_t localId = PeerManager::GetInstance().GetLocalPlayerId();
-
         for (const auto& p : players) {
-            bool isLocal = (p.playerId == 0 || p.playerId == localId);
+            bool isLocal = (p.playerId == 0);  // local player has id 0
 
             // Name + (you) tag
             if (isLocal)
-                ImGui::TextColored(ImVec4(0.6f, 1.0f, 0.6f, 1.0f), "%s  (you)", p.playerName.c_str());
+                ImGui::TextColored(ImVec4(0.6f, 1.0f, 0.6f, 1.0f), "%s  (vous)", p.playerName.c_str());
             else if (!p.isAlive && p.maxHealth > 0)
-                ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "%s  [dead]", p.playerName.c_str());
+                ImGui::TextColored(ImVec4(0.5f, 0.5f, 0.5f, 1.0f), "%s  [mort]", p.playerName.c_str());
             else
                 ImGui::Text("%s", p.playerName.c_str());
 
@@ -368,8 +372,6 @@ void Overlay::RenderMainMenu() {
                 ImVec4 barColor = frac > 0.5f ? ImVec4(0.2f, 0.7f, 0.2f, 1.0f)
                                 : frac > 0.25f ? ImVec4(0.8f, 0.6f, 0.1f, 1.0f)
                                 :               ImVec4(0.8f, 0.1f, 0.1f, 1.0f);
-                char hpLabel[32];
-                snprintf(hpLabel, sizeof(hpLabel), "%d / %d", p.health, p.maxHealth);
                 ImGui::PushStyleColor(ImGuiCol_PlotHistogram, barColor);
                 ImGui::ProgressBar(frac, ImVec2(-1, 6), "");
                 ImGui::PopStyleColor();
@@ -379,101 +381,38 @@ void Overlay::RenderMainMenu() {
         }
 
         ImGui::Separator();
-        ImGui::Text("%zu player%s", players.size(), players.size() == 1 ? "" : "s");
+        ImGui::Text("%zu joueur%s connecte%s",
+                    players.size(),
+                    players.size() == 1 ? "" : "s",
+                    players.size() == 1 ? "" : "s");
 
         ImGui::Spacing();
         ImGui::Separator();
         ImGui::Spacing();
-
-        // Share session code (visible only if we are the host and have codes)
-        if (!m_activePublicCode.empty() || !m_activeLANCode.empty()) {
-            ImGui::TextDisabled("Share session code:");
-            ImGui::Separator();
-
-            if (!m_activePublicCode.empty()) {
-                ImGui::TextDisabled("  Internet:");
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Copy##scodepub")) {
-                    CopyToClipboard(m_activePublicCode);
-                    ShowNotification("Internet session code copied!", 2.5f);
-                }
-            }
-            if (!m_activeLANCode.empty()) {
-                ImGui::TextDisabled("  LAN/VPN: ");
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Copy##scodelan")) {
-                    CopyToClipboard(m_activeLANCode);
-                    ShowNotification("LAN session code copied!", 2.5f);
-                }
-            }
-            ImGui::Spacing();
-            ImGui::Separator();
-            ImGui::Spacing();
-        }
 
         // Seamless tools
-        ImGui::TextDisabled("Tools");
+        ImGui::TextDisabled("Outils");
         ImGui::Separator();
 
-        if (ImGui::Button("Grant Soapstones", ImVec2(-1, 0))) {
+        if (ImGui::Button("Donner les pierres blanches", ImVec2(-1, 0))) {
             if (DS2Coop::Sync::PlayerSync::GetInstance().GrantSoapstones()) {
-                ShowNotification("Soapstones added to inventory!", 4.0f);
+                ShowNotification("Pierres blanches ajoutees a l'inventaire !", 4.0f);
             } else {
-                ShowNotification("Could not grant items. Try again in-game.", 4.0f);
+                ShowNotification("Impossible. Etes-vous en jeu ?", 4.0f);
             }
         }
-
-        ImGui::Spacing();
-
-        // Emergency teleport — only useful for guests (grayed out if we are host)
-        bool isHost = DS2Coop::Network::PeerManager::GetInstance().IsHost();
-        if (isHost) {
-            ImGui::BeginDisabled(true);
-            ImGui::Button("⚡  TP sur l'hôte  (vous êtes l'hôte)", ImVec2(-1, 0));
-            ImGui::EndDisabled();
-        } else {
-            // Show cooldown in button label
-            static DWORD s_lastTpMs = 0;
-            constexpr DWORD TP_CD = 10000;
-            DWORD elapsed = GetTickCount() - s_lastTpMs;
-            bool onCooldown = (s_lastTpMs > 0 && elapsed < TP_CD);
-
-            char tpLabel[64];
-            if (onCooldown) {
-                DWORD secs = (TP_CD - elapsed) / 1000 + 1;
-                snprintf(tpLabel, sizeof(tpLabel), "⚡  TP sur l'hôte  (%us)", secs);
-            } else {
-                snprintf(tpLabel, sizeof(tpLabel), "⚡  TP sur l'hôte");
-            }
-
-            ImGui::BeginDisabled(onCooldown);
-            if (ImGui::Button(tpLabel, ImVec2(-1, 0))) {
-                if (DS2Coop::Sync::PlayerSync::GetInstance().TeleportToHost()) {
-                    s_lastTpMs = GetTickCount();
-                } else {
-                    // Notification already shown by TeleportToHost()
-                }
-            }
-            ImGui::EndDisabled();
-
-            if (!onCooldown) {
-                ImGui::TextDisabled("  Utiliser si bloqué ou déconnecté de l'hôte.");
-            }
-        }
+        ImGui::TextDisabled("  Donne la Pierre Blanche de Yui si vous ne l'avez pas.");
 
         ImGui::Spacing();
         ImGui::Separator();
         ImGui::Spacing();
 
-        if (ImGui::Button("Leave Session", ImVec2(-1, 0))) {
+        if (ImGui::Button("Desactiver le mode seamless", ImVec2(-1, 0))) {
             sessionMgr.LeaveSession();
             DS2Coop::Hooks::ProtobufHooks::SetSeamlessActive(false);
-            // Clear cached session codes so they don't appear next time
-            m_activePublicCode.clear();
-            m_activeLANCode.clear();
             m_codeInput[0] = '\0';
             m_visible = false;
-            ShowNotification("Left session.", 3.0f);
+            ShowNotification("Mode seamless desactive.", 3.0f);
         }
 
     } else {
@@ -512,11 +451,11 @@ void Overlay::RenderMainMenu() {
             ImGui::Spacing();
             ImGui::TextDisabled("Derniere session : mot de passe \"%s\"", lastPw.c_str());
             ImGui::Spacing();
-            if (ImGui::Button("Retenter la connexion", ImVec2(-1, 0))) {
+            if (ImGui::Button("Reactiver le mode seamless", ImVec2(-1, 0))) {
                 if (sessionMgr.JoinSession(lastPw)) {
-                    ShowNotification("Recherche du lobby en cours...", 5.0f);
+                    ShowNotification("Mode seamless ACTIF — attendez l'invocation via pierre blanche.", 6.0f);
                 } else {
-                    ShowNotification("Echec. Steam disponible ?", 4.0f);
+                    ShowNotification("Echec. Verifiez les logs.", 4.0f);
                 }
             }
         }
@@ -530,7 +469,7 @@ void Overlay::RenderMainMenu() {
 }
 
 // ============================================================================
-// Host menu — Steam lobby (no IP, no session codes)
+// Host menu — activate seamless mode (protobuf hooks)
 // ============================================================================
 void Overlay::RenderHostMenu() {
     if (!ImGui::Begin("HEBERGER###main", &m_visible,
@@ -540,26 +479,25 @@ void Overlay::RenderHostMenu() {
         return;
     }
 
-    ImGui::TextDisabled("Cree un lobby Steam prive.");
-    ImGui::TextDisabled("Donnez le mot de passe a vos amis pour qu'ils puissent rejoindre.");
+    ImGui::TextColored(ImVec4(0.9f, 0.78f, 0.25f, 1.0f), "Mode seamless — comment ca marche :");
+    ImGui::Spacing();
+    ImGui::TextWrapped("1. Activez le mode seamless (bouton ci-dessous).");
+    ImGui::TextWrapped("2. Votre ami active aussi le mod de son cote.");
+    ImGui::TextWrapped("3. Invoquez-vous mutuellement via la Pierre Blanche de Yui, comme d'habitude.");
+    ImGui::TextWrapped("4. Une fois invoque, la session reste active : morts, boss, warps ne deconnectent plus.");
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
 
     // ── Password field ──────────────────────────────────────────────────────
-    ImGui::TextDisabled("Mot de passe de session :");
+    ImGui::TextDisabled("Mot de passe (meme valeur que dans le .ini) :");
     ImGui::SetNextItemWidth(-1);
     ImGui::InputText("##password", m_inputPassword, sizeof(m_inputPassword));
     ImGui::Spacing();
 
     bool hasPassword = strlen(m_inputPassword) > 0;
-    if (hasPassword) {
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.3f, 0.9f, 0.4f, 1.0f));
-        ImGui::Text("  Partagez ce mot de passe avec vos amis.");
-        ImGui::PopStyleColor();
-        ImGui::Spacing();
-    } else {
-        ImGui::TextDisabled("  Entrez un mot de passe pour commencer.");
+    if (!hasPassword) {
+        ImGui::TextDisabled("  Entrez un mot de passe pour continuer.");
         ImGui::Spacing();
     }
 
@@ -568,13 +506,13 @@ void Overlay::RenderHostMenu() {
 
     // ── Start / Back ───────────────────────────────────────────────────────
     ImGui::BeginDisabled(!hasPassword);
-    if (ImGui::Button("Demarrer l'hebergement", ImVec2(-1, 0))) {
+    if (ImGui::Button("Activer le mode seamless (Hote)", ImVec2(-1, 0))) {
         auto& sessionMgr = SessionManager::GetInstance();
         if (sessionMgr.CreateSession(m_inputPassword)) {
-            ShowNotification("Creation du lobby Steam...", 4.0f);
+            ShowNotification("Mode seamless ACTIF — invoquez votre ami via pierre blanche.", 6.0f);
             m_currentState = MenuState::Main;
         } else {
-            ShowNotification("Echec de creation de session. Verifiez les logs.", 4.0f);
+            ShowNotification("Echec. Verifiez les logs.", 4.0f);
         }
     }
     ImGui::EndDisabled();
@@ -588,7 +526,7 @@ void Overlay::RenderHostMenu() {
 }
 
 // ============================================================================
-// Join menu — Steam lobby discovery by password
+// Join menu — activate seamless mode (protobuf hooks, guest side)
 // ============================================================================
 void Overlay::RenderJoinMenu() {
     if (!ImGui::Begin("REJOINDRE###main", &m_visible,
@@ -598,14 +536,18 @@ void Overlay::RenderJoinMenu() {
         return;
     }
 
-    ImGui::TextDisabled("Rejoindre la session Steam d'un ami.");
-    ImGui::TextDisabled("Entrez le meme mot de passe que l'hote.");
+    ImGui::TextColored(ImVec4(0.9f, 0.78f, 0.25f, 1.0f), "Mode seamless — comment ca marche :");
+    ImGui::Spacing();
+    ImGui::TextWrapped("1. Activez le mode seamless (bouton ci-dessous).");
+    ImGui::TextWrapped("2. L'hote active aussi le mod de son cote.");
+    ImGui::TextWrapped("3. Attendez l'invocation via la Pierre Blanche de Yui de l'hote.");
+    ImGui::TextWrapped("4. Une fois invoque, la session reste active : morts, boss, warps ne deconnectent plus.");
     ImGui::Spacing();
     ImGui::Separator();
     ImGui::Spacing();
 
     // ── Password field ──────────────────────────────────────────────────────
-    ImGui::TextDisabled("Mot de passe de session :");
+    ImGui::TextDisabled("Mot de passe (meme valeur que dans le .ini) :");
     ImGui::SetNextItemWidth(-1);
     ImGui::InputText("##pw", m_inputPassword, sizeof(m_inputPassword));
     ImGui::Spacing();
@@ -613,7 +555,7 @@ void Overlay::RenderJoinMenu() {
     bool hasPassword = strlen(m_inputPassword) > 0;
 
     if (!hasPassword) {
-        ImGui::TextDisabled("Entrez le mot de passe communique par l'hote.");
+        ImGui::TextDisabled("Entrez le mot de passe (meme que l'hote).");
         ImGui::Spacing();
     }
 
@@ -622,13 +564,13 @@ void Overlay::RenderJoinMenu() {
 
     // ── Join button ─────────────────────────────────────────────────────────
     ImGui::BeginDisabled(!hasPassword);
-    if (ImGui::Button("Rejoindre la session", ImVec2(-1, 0))) {
+    if (ImGui::Button("Activer le mode seamless (Joueur)", ImVec2(-1, 0))) {
         auto& sessionMgr = SessionManager::GetInstance();
         if (sessionMgr.JoinSession(m_inputPassword)) {
-            ShowNotification("Recherche du lobby Steam...", 5.0f);
+            ShowNotification("Mode seamless ACTIF — attendez l'invocation via pierre blanche.", 6.0f);
             m_currentState = MenuState::Main;
         } else {
-            ShowNotification("Impossible de demarrer la recherche. Steam disponible ?", 4.0f);
+            ShowNotification("Echec. Verifiez les logs.", 4.0f);
         }
     }
     ImGui::EndDisabled();
@@ -694,10 +636,8 @@ void Overlay::RenderPlayerHUD() {
         return;
     }
 
-    uint64_t localId = PeerManager::GetInstance().GetLocalPlayerId();
-
     for (const auto& p : players) {
-        bool isLocal = (p.playerId == 0 || p.playerId == localId);
+        bool isLocal = (p.playerId == 0);
         bool isDead  = (!p.isAlive && p.maxHealth > 0);
 
         // ── HP bar ──────────────────────────────────────────────────────────
