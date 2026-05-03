@@ -368,7 +368,7 @@ namespace PhantomSlots {
 }
 
 // ============================================================================
-// CE FINDINGS — session de reverse engineering 2026-05-02
+// CE FINDINGS — sessions de reverse engineering 2026-05-02 / 2026-05-03
 //
 // NetSessionManager reference : DarkSoulsII.exe+0x51B272
 //   Instruction : 48 8B 0D [RIP+offset] 48 85 C9 74 ?? 48 8B 49 18 E8
@@ -380,6 +380,48 @@ namespace PhantomSlots {
 //           mov rax,[rcx] / add rsp,20 / pop rdi
 //           jmp [rax+0x90]   ; → vtable slot 18 du sous-objet à offset 0x40
 //   = dispatche vers this->field_0x40->vtable[18]()
+//
+// CALL STACK au moment du phantom spawn (breakpoint sur write slot fantôme)
+// Capturée avec un vrai joueur invoqué, DS2 SotFS x64 v1.02 :
+//
+//   steam_api64.SteamAPI_SetTryCatchCallbacks+1340   ← écriture slot Steam
+//   DarkSoulsII.exe+A713BA   ← DS2 invoke Steam callbacks
+//   DarkSoulsII.exe+A6E82A
+//   DarkSoulsII.exe+A5B64F   ← handler phantom session DS2
+//   DarkSoulsII.exe+51F3C9   ← session manager update (près de +51B272)
+//   DarkSoulsII.exe+2C6656   ← session dispatch (près du thunk +2C71B0)
+//   DarkSoulsII.exe+27AB9F
+//   DarkSoulsII.exe+285607
+//   DarkSoulsII.exe+276170
+//   DarkSoulsII.exe+2A2EB8
+//   DarkSoulsII.exe+2A42E5
+//   DarkSoulsII.exe+2A14D4
+//   DarkSoulsII.exe+29086D
+//   DarkSoulsII.exe+6B85C    ← game update loop
+//   DarkSoulsII.exe+4565A
+//   DarkSoulsII.exe+470B9
+//   DarkSoulsII.exe+46EE2
+//   DarkSoulsII.exe+2730C
+//   DarkSoulsII.exe+27808
+//   DarkSoulsII.exe+6C90E
+//   DarkSoulsII.exe+4189C
+//   DarkSoulsII.exe+5076C1
+//   DarkSoulsII.exe+501CF1
+//   DarkSoulsII.exe+1C00FE
+//   DarkSoulsII.exe+1C3335
+//   DarkSoulsII.exe+30CDB3
+//   DarkSoulsII.exe+B31558
+//   DarkSoulsII.exe+2EF24E
+//   DarkSoulsII.exe+AF016B
+//   DarkSoulsII.exe+AF0A54
+//   DarkSoulsII.exe+AEEF00
+//   DarkSoulsII.exe+2EB90F
+//   DarkSoulsII.exe+C30D40
+//   KERNEL32.BaseThreadInitThunk+17
+//   ntdll.RtlUserThreadStart+2C
+//
+// Prochaine étape : disassembler +A5B64F pour trouver SpawnPhantom
+// (c'est le handler DS2 qui traite la connexion phantom avant d'appeler Steam)
 // ============================================================================
 
 } // namespace Addresses

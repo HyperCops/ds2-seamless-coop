@@ -117,17 +117,25 @@ jmp [rax+0x90]        ; → vtable slot 18
 ```
 = dispatche `this->field_0x40->vtable[18]()`
 
-### SpawnPhantom — à trouver
+### Call stack phantom spawn — capturée 2026-05-03
 
-**Méthode** (avec un ami ou PNJ invocable) :
-1. CE → First Scan, Value Type = `Byte`, valeur = `0` (fantôme absent)
-2. Invoquer le fantôme → Next Scan valeur = `1`
-3. Répéter 2-3 cycles → isoler `+0x16A4865` et `+0x16A4899`
-4. Clic droit → **"Find out what ACCESSES this address"** (VEH Debugger activé)
-5. Invoquer à nouveau → CE montre l'instruction → remonter au début de la fonction
-6. Noter les 16 premiers bytes du prologue → c'est SpawnPhantom
+Breakpoint posé sur l'écriture du slot Steam au moment d'une vraie invocation joueur.
+Les fonctions DS2 dans la chaîne d'appel (du plus proche au plus loin du spawn) :
 
-**Une fois trouvé** : appeler depuis `SessionManager::Update()` quand `m_state` passe à `Connected`.
+| Offset | Rôle probable |
+|---|---|
+| `+A713BA` | DS2 invoke Steam callbacks |
+| `+A6E82A` | intermédiaire |
+| `+A5B64F` | **handler phantom session** ← à disassembler en priorité |
+| `+51F3C9` | session manager update (près du NetSessionManager `+51B272`) |
+| `+2C6656` | session dispatch (près du thunk `+2C71B0`) |
+| `+6B85C` | game update loop |
+
+**Prochaine étape CE** : disassembler `+A5B64F` pour trouver SpawnPhantom.
+C'est ce handler qui traite la connexion phantom côté DS2 avant d'appeler Steam.
+
+**Note** : le slot qu'on traquait (`+0x16A4865`, `+0x16A4899`) était du Steam interne
+(steam_api64.dll), pas un slot DS2 natif. Le vrai slot fantôme DS2 est ailleurs.
 
 ---
 
