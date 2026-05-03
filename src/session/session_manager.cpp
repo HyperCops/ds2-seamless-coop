@@ -23,6 +23,90 @@ using namespace DS2Coop::Session;
 using namespace DS2Coop::Utils;
 
 // ============================================================================
+// SEH-safe Steam vtable wrappers
+//
+// The Steam vtable calls can crash if slot numbers are wrong for this
+// specific steam_api64.dll version, or if the interface pointer is bad.
+// These C-style helpers wrap each call in __try/__except so a bad vtable
+// call is caught and logged rather than crashing the game.
+//
+// IMPORTANT: __try/__except cannot be used in C++ functions that have
+// objects with destructors in scope (MSVC C2712). These are pure C-style.
+// ============================================================================
+
+// Safe uint64 vtable call — used for SteamAPICall_t return values
+static uint64_t SafeVCall0(void* iface, int slot) {
+    __try {
+        using Fn = uint64_t(*)(void*);
+        auto vtable = *reinterpret_cast<void***>(iface);
+        return reinterpret_cast<Fn>(vtable[slot])(iface);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        LOG_ERROR("SafeVCall0: crash at slot %d — vtable mismatch?", slot);
+        return 0;
+    }
+}
+static uint64_t SafeVCall1i(void* iface, int slot, int arg0) {
+    __try {
+        using Fn = uint64_t(*)(void*, int);
+        auto vtable = *reinterpret_cast<void***>(iface);
+        return reinterpret_cast<Fn>(vtable[slot])(iface, arg0);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        LOG_ERROR("SafeVCall1i: crash at slot %d", slot);
+        return 0;
+    }
+}
+static uint64_t SafeVCall2u64(void* iface, int slot, uint64_t arg0) {
+    __try {
+        using Fn = uint64_t(*)(void*, uint64_t);
+        auto vtable = *reinterpret_cast<void***>(iface);
+        return reinterpret_cast<Fn>(vtable[slot])(iface, arg0);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        LOG_ERROR("SafeVCall2u64: crash at slot %d", slot);
+        return 0;
+    }
+}
+static uint64_t SafeVCall2u64i(void* iface, int slot, uint64_t arg0, int arg1) {
+    __try {
+        using Fn = uint64_t(*)(void*, uint64_t, int);
+        auto vtable = *reinterpret_cast<void***>(iface);
+        return reinterpret_cast<Fn>(vtable[slot])(iface, arg0, arg1);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        LOG_ERROR("SafeVCall2u64i: crash at slot %d", slot);
+        return 0;
+    }
+}
+static void SafeVCallStringFilter(void* iface, int slot,
+                                  const char* key, const char* val, int cmp) {
+    __try {
+        using Fn = void(*)(void*, const char*, const char*, int);
+        auto vtable = *reinterpret_cast<void***>(iface);
+        reinterpret_cast<Fn>(vtable[slot])(iface, key, val, cmp);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        LOG_ERROR("SafeVCallStringFilter: crash at slot %d", slot);
+    }
+}
+static bool SafeVCallSetLobbyData(void* iface, int slot,
+                                   uint64_t lobby, const char* key, const char* val) {
+    __try {
+        using Fn = bool(*)(void*, uint64_t, const char*, const char*);
+        auto vtable = *reinterpret_cast<void***>(iface);
+        return reinterpret_cast<Fn>(vtable[slot])(iface, lobby, key, val);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        LOG_ERROR("SafeVCallSetLobbyData: crash at slot %d", slot);
+        return false;
+    }
+}
+static void SafeVCallLeaveLobby(void* iface, int slot, uint64_t lobby) {
+    __try {
+        using Fn = void(*)(void*, uint64_t);
+        auto vtable = *reinterpret_cast<void***>(iface);
+        reinterpret_cast<Fn>(vtable[slot])(iface, lobby);
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        LOG_ERROR("SafeVCallLeaveLobby: crash at slot %d", slot);
+    }
+}
+
+// ============================================================================
 // Persistance du dernier mot de passe pour le bouton "Rejoindre dernière session"
 // ============================================================================
 static const char* LAST_PASSWORD_FILE = "ds2_last_session.ini";
@@ -88,60 +172,63 @@ bool SessionManager::CreateSession(const std::string& password) {
         return false;
     }
 
-    LOG_INFO("Creating new session (Steam lobby)...");
+    LOG_INFO("Creating seamless co-op session (host)...");
 
-    TransitionToState(SessionState::Connecting);
-
-    m_isHost         = true;
+    m_isHost          = true;
     m_sessionPassword = password;
+    m_localPlayerId   = 0;
 
-    // PeerManager: set up host flag + crypto key immediately so we can receive
-    // incoming P2P connections while the lobby creation is in flight.
-    auto& peerMgr = Network::PeerManager::GetInstance();
-    peerMgr.CreateSession(password);
-    m_localPlayerId = peerMgr.GetLocalPlayerId();
-
-    // Initialize sync systems so we can read the character name
+    // Initialize sync systems
     Sync::PlayerSync::GetInstance().Initialize();
     Sync::ProgressSync::GetInstance().Initialize();
 
     // Add local player entry
     SessionPlayer localPlayer{};
-    localPlayer.playerId  = m_localPlayerId;
-    localPlayer.isAlive   = true;
-    localPlayer.isReady   = true;
-    localPlayer.soulLevel = 0;
+    localPlayer.playerId   = 0;
+    localPlayer.isAlive    = true;
+    localPlayer.isReady    = true;
+    localPlayer.soulLevel  = 0;
     localPlayer.health = localPlayer.maxHealth = 0;
     localPlayer.x = localPlayer.y = localPlayer.z = 0.0f;
-
     std::string charName = Sync::PlayerSync::GetInstance().GetLocalCharacterName();
     localPlayer.playerName = charName.empty() ? "Host" : charName;
-
     {
         std::lock_guard<std::mutex> lock(m_playersMutex);
         m_players.push_back(localPlayer);
     }
 
-    // Set up sign filtering
     Hooks::ProtobufHooks::ClearSessionSteamIds();
-    std::string localSteam = Hooks::ProtobufHooks::GetLocalSteamId();
-    if (!localSteam.empty())
-        Hooks::ProtobufHooks::AddSessionSteamId(localSteam);
-
     Hooks::GameState::ClearBroadcastFlagCache();
 
-    // Kick off async Steam lobby creation
+    // Activate disconnect blocking immediately
+    Hooks::ProtobufHooks::SetSeamlessActive(true);
+
+    // Try to create a Steam lobby for discovery (so guest can find us by password).
+    // Uses SEH-safe wrappers — a vtable crash is caught and logged, not fatal.
     void* mm = SteamAPI::Matchmaking();
-    if (!mm) {
-        LOG_ERROR("SteamMatchmaking unavailable — cannot create lobby");
-        TransitionToState(SessionState::Error);
-        return false;
+    if (mm) {
+        LOG_INFO("  Steam available — creating invisible lobby (password='%s')...", password.c_str());
+        // ISteamMatchmaking slot 12 = CreateLobby(ELobbyType, int maxMembers)
+        // k_ELobbyTypeInvisible (3) = not listed publicly, only joinable by password
+        m_createLobbyCall = SafeVCall2u64i(mm, 12, 3 /*k_ELobbyTypeInvisible*/,
+                                           (int)SeamlessCoopMod::GetInstance().GetConfig().max_players);
+        if (m_createLobbyCall != 0) {
+            LOG_INFO("  Lobby creation async call started (handle=%llu)", m_createLobbyCall);
+            // State stays at Connecting until LobbyCreated_t callback fires
+            TransitionToState(SessionState::Connecting);
+        } else {
+            LOG_WARNING("  CreateLobby returned null handle — vtable slot wrong? Fallback to local mode");
+            TransitionToState(SessionState::Connected);
+        }
+    } else {
+        LOG_WARNING("  ISteamMatchmaking not available — seamless active without lobby discovery");
+        TransitionToState(SessionState::Connected);
     }
 
-    const auto& cfg = DS2Coop::SeamlessCoopMod::GetInstance().GetConfig();
-    m_createLobbyCall = SteamMM::CreateLobby(mm, k_ELobbyTypePrivate,
-                                              static_cast<int>(cfg.max_players));
-    LOG_INFO("Steam CreateLobby dispatched (async)... password='%s'", password.c_str());
+    SaveLastPassword(password);
+    LOG_INFO("Seamless co-op ACTIVE (host) — disconnect blocking ON");
+    LOG_INFO("  Invite friend: same password '%s' on their side, then JOIN", password.c_str());
+    LOG_INFO("  Until SpawnPhantom is found: use white soapstone once to connect");
     return true;
 }
 
@@ -153,62 +240,63 @@ bool SessionManager::JoinSession(const std::string& password) {
         return false;
     }
 
-    LOG_INFO("Searching for session with password '%s'...", password.c_str());
-
-    TransitionToState(SessionState::Connecting);
+    LOG_INFO("Joining seamless co-op session (guest, password='%s')...", password.c_str());
 
     m_isHost          = false;
     m_sessionPassword = password;
     m_pendingPassword = password;
 
-    // Initialize sync systems BEFORE joining P2P so the handshake has the real name
+    // Initialize sync systems BEFORE joining so the handshake has the real name
     Sync::PlayerSync::GetInstance().Initialize();
     Sync::ProgressSync::GetInstance().Initialize();
 
-    auto& peerMgr = Network::PeerManager::GetInstance();
-    m_localPlayerId = peerMgr.GetLocalPlayerId();
+    m_localPlayerId = 0;
 
     // Add local player entry
     SessionPlayer localPlayer{};
-    localPlayer.playerId  = m_localPlayerId;
-    localPlayer.isAlive   = true;
-    localPlayer.isReady   = true;
-    localPlayer.soulLevel = 0;
+    localPlayer.playerId   = 0;
+    localPlayer.isAlive    = true;
+    localPlayer.isReady    = true;
+    localPlayer.soulLevel  = 0;
     localPlayer.health = localPlayer.maxHealth = 0;
     localPlayer.x = localPlayer.y = localPlayer.z = 0.0f;
-
     std::string charName = Sync::PlayerSync::GetInstance().GetLocalCharacterName();
     localPlayer.playerName = charName.empty() ? "Player" : charName;
-
     {
         std::lock_guard<std::mutex> lock(m_playersMutex);
         m_players.push_back(localPlayer);
     }
 
-    // Set up sign filtering
     Hooks::ProtobufHooks::ClearSessionSteamIds();
-    std::string localSteam = Hooks::ProtobufHooks::GetLocalSteamId();
-    if (!localSteam.empty())
-        Hooks::ProtobufHooks::AddSessionSteamId(localSteam);
-
     Hooks::GameState::ClearBroadcastFlagCache();
 
-    // Kick off async lobby list search filtered by our password
+    // Activate disconnect blocking immediately
+    Hooks::ProtobufHooks::SetSeamlessActive(true);
+
+    // Try to find the host's Steam lobby by password.
     void* mm = SteamAPI::Matchmaking();
-    if (!mm) {
-        LOG_ERROR("SteamMatchmaking unavailable — cannot search for lobby");
-        TransitionToState(SessionState::Error);
-        return false;
+    if (mm) {
+        LOG_INFO("  Steam available — searching for lobby with password '%s'...", password.c_str());
+        // ISteamMatchmaking slot 5  = AddRequestLobbyListStringFilter(key, val, cmp)
+        // ISteamMatchmaking slot 10 = AddRequestLobbyListResultCountFilter(count)
+        // ISteamMatchmaking slot 4  = RequestLobbyList()
+        SafeVCallStringFilter(mm, 5, "ds2coop_pw", password.c_str(), 0 /*k_ELobbyComparisonEqual*/);
+        SafeVCall1i(mm, 10, 1); // limit to 1 result
+        m_requestLobbyCall = SafeVCall0(mm, 4);
+        if (m_requestLobbyCall != 0) {
+            LOG_INFO("  Lobby search started (handle=%llu)", m_requestLobbyCall);
+            TransitionToState(SessionState::Connecting);
+        } else {
+            LOG_WARNING("  RequestLobbyList returned null — vtable slot wrong? Fallback to local mode");
+            TransitionToState(SessionState::Connected);
+        }
+    } else {
+        LOG_WARNING("  ISteamMatchmaking not available — seamless active without lobby discovery");
+        TransitionToState(SessionState::Connected);
     }
 
-    SteamMM::AddRequestLobbyListStringFilter(mm, "ds2coop_pw", password.c_str(),
-                                             k_ELobbyComparisonEqual);
-    SteamMM::AddRequestLobbyListResultCountFilter(mm, 1);
-    m_requestLobbyCall = SteamMM::RequestLobbyList(mm);
-
     SaveLastPassword(password);
-
-    LOG_INFO("Steam RequestLobbyList dispatched (async)...");
+    LOG_INFO("Seamless co-op ACTIVE (guest) — disconnect blocking ON");
     return true;
 }
 
@@ -217,26 +305,24 @@ void SessionManager::LeaveSession() {
 
     LOG_INFO("Leaving session...");
 
-    // Cancel pending async calls
+    // Disable seamless disconnect blocking
+    Hooks::ProtobufHooks::SetSeamlessActive(false);
+
+    // Leave Steam lobby if we're in one
+    if (m_currentLobbyId != 0) {
+        void* mm = SteamAPI::Matchmaking();
+        if (mm) {
+            SafeVCallLeaveLobby(mm, 14, m_currentLobbyId); // slot 14 = LeaveLobby
+        }
+    }
+
     m_createLobbyCall  = 0;
     m_requestLobbyCall = 0;
     m_joinLobbyCall    = 0;
+    m_currentLobbyId   = 0;
 
-    // Leave Steam lobby
-    if (m_currentLobbyId != 0) {
-        void* mm = SteamAPI::Matchmaking();
-        if (mm)
-            SteamMM::LeaveLobby(mm, CSteamID(m_currentLobbyId));
-        m_currentLobbyId = 0;
-    }
-
-    // Effacer la sauvegarde de dernière session à la déconnexion volontaire
     ClearLastPassword();
-
     Hooks::GameState::ClearBroadcastFlagCache();
-
-    auto& peerMgr = Network::PeerManager::GetInstance();
-    peerMgr.LeaveSession();
 
     {
         std::lock_guard<std::mutex> lock(m_playersMutex);
@@ -244,108 +330,137 @@ void SessionManager::LeaveSession() {
     }
 
     TransitionToState(SessionState::Disconnected);
-
     LOG_INFO("Left session");
+}
+
+// ── Safe Steam API-call polling helpers ──────────────────────────────────────
+// Avoids putting C++ objects (LobbyCreated_t etc.) in scope during __try block.
+static bool SafeIsCallCompleted(void* utils, uint64_t call, bool* failed) {
+    *failed = false;
+    __try {
+        using Fn = bool(*)(void*, uint64_t, bool*);
+        auto vtable = *reinterpret_cast<void***>(utils);
+        return reinterpret_cast<Fn>(vtable[11])(utils, call, failed); // slot 11 = IsAPICallCompleted
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        LOG_ERROR("SafeIsCallCompleted: vtable crash");
+        *failed = true;
+        return true; // treat as completed with failure
+    }
+}
+static bool SafeGetCallResult(void* utils, uint64_t call,
+                               void* outBuf, int bufSize, int cbId, bool* failed) {
+    *failed = false;
+    __try {
+        using Fn = bool(*)(void*, uint64_t, void*, int, int, bool*);
+        auto vtable = *reinterpret_cast<void***>(utils);
+        return reinterpret_cast<Fn>(vtable[13])(utils, call, outBuf, bufSize, cbId, failed); // slot 13 = GetAPICallResult
+    } __except(EXCEPTION_EXECUTE_HANDLER) {
+        LOG_ERROR("SafeGetCallResult: vtable crash");
+        *failed = true;
+        return false;
+    }
 }
 
 void SessionManager::Update(float deltaTime) {
     // Always pump Steam's callback queue
     SteamAPI::RunCallbacks();
 
-    // Poll async Steam lobby operations (even in Connecting state)
-    if (m_state != SessionState::Disconnected) {
+    // Poll async Steam lobby operations
+    if (m_state == SessionState::Connecting || m_state == SessionState::Connected ||
+        m_state == SessionState::InGame) {
         void* utils = SteamAPI::Utils();
         void* mm    = SteamAPI::Matchmaking();
 
         if (utils && mm) {
             bool failed = false;
 
-            // ── Create lobby result (host) ─────────────────────────────────
-            if (m_createLobbyCall != 0) {
-                if (SteamUt::IsAPICallCompleted(utils, m_createLobbyCall, &failed)) {
-                    LobbyCreated_t result{};
-                    SteamUt::GetAPICallResult(utils, m_createLobbyCall,
-                        &result, sizeof(result), LobbyCreated_t::k_iCallback, &failed);
-                    m_createLobbyCall = 0;
+            // ── Create lobby result (host) ────────────────────────────────
+            if (m_createLobbyCall != 0 &&
+                SafeIsCallCompleted(utils, m_createLobbyCall, &failed)) {
 
-                    if (!failed && result.m_eResult == 1 /* k_EResultOK */) {
-                        m_currentLobbyId = result.m_ulSteamIDLobby;
+                LobbyCreated_t result{};
+                SafeGetCallResult(utils, m_createLobbyCall,
+                    &result, sizeof(result), LobbyCreated_t::k_iCallback, &failed);
+                m_createLobbyCall = 0;
 
-                        // Tag lobby with password so joiners can find it
-                        SteamMM::SetLobbyData(mm, CSteamID(m_currentLobbyId),
-                                              "ds2coop_pw", m_sessionPassword.c_str());
+                if (!failed && result.m_eResult == 1 /* k_EResultOK */) {
+                    m_currentLobbyId = result.m_ulSteamIDLobby;
+                    LOG_INFO("Steam lobby created: %llu", m_currentLobbyId);
 
-                        Network::PeerManager::GetInstance().SetCurrentLobby(m_currentLobbyId);
+                    // Tag lobby with password — slot 20 = SetLobbyData(lobby, key, val)
+                    SafeVCallSetLobbyData(mm, 20, m_currentLobbyId,
+                                         "ds2coop_pw", m_sessionPassword.c_str());
 
-                        TransitionToState(SessionState::Connected);
-                        LOG_INFO("Steam lobby created: %llu (password='%s')",
-                                 m_currentLobbyId, m_sessionPassword.c_str());
-                        UI::Overlay::GetInstance().ShowNotification(
-                            "Session creee ! Partagez le mot de passe.", 6.0f);
-                    } else {
-                        LOG_ERROR("Steam CreateLobby failed (eResult=%u, apiCallFailed=%d)",
-                                  result.m_eResult, (int)failed);
-                        TransitionToState(SessionState::Error);
-                        UI::Overlay::GetInstance().ShowNotification(
-                            "Echec creation du lobby Steam. Verifiez Steam.", 5.0f);
-                    }
+                    TransitionToState(SessionState::Connected);
+                    UI::Overlay::GetInstance().ShowNotification(
+                        "Lobby cree ! Ton ami peut rejoindre avec le meme mot de passe.", 6.0f);
+                    UI::Overlay::GetInstance().ShowCenteredNotification(
+                        "Mode seamless ACTIF", 4.0f, 1);
+                } else {
+                    LOG_ERROR("CreateLobby failed (eResult=%u, failed=%d)",
+                              result.m_eResult, (int)failed);
+                    // Don't go to Error — we still have protobuf hooks active
+                    TransitionToState(SessionState::Connected);
+                    UI::Overlay::GetInstance().ShowNotification(
+                        "Lobby Steam indisponible — mode seamless actif sans decouverte.", 5.0f);
                 }
             }
 
             // ── RequestLobbyList result (joiner) ──────────────────────────
-            if (m_requestLobbyCall != 0) {
-                if (SteamUt::IsAPICallCompleted(utils, m_requestLobbyCall, &failed)) {
-                    LobbyMatchList_t result{};
-                    SteamUt::GetAPICallResult(utils, m_requestLobbyCall,
-                        &result, sizeof(result), LobbyMatchList_t::k_iCallback, &failed);
-                    m_requestLobbyCall = 0;
+            if (m_requestLobbyCall != 0 &&
+                SafeIsCallCompleted(utils, m_requestLobbyCall, &failed)) {
 
-                    if (!failed && result.m_nLobbiesMatching > 0) {
-                        CSteamID lobbyId = SteamMM::GetLobbyByIndex(mm, 0);
-                        m_joinLobbyCall  = SteamMM::JoinLobby(mm, lobbyId);
-                        LOG_INFO("Found %u lobby/lobbies with matching password — joining...",
-                                 result.m_nLobbiesMatching);
+                LobbyMatchList_t result{};
+                SafeGetCallResult(utils, m_requestLobbyCall,
+                    &result, sizeof(result), LobbyMatchList_t::k_iCallback, &failed);
+                m_requestLobbyCall = 0;
+
+                if (!failed && result.m_nLobbiesMatching > 0) {
+                    // slot 11 = GetLobbyByIndex(int) → returns CSteamID as uint64
+                    // We pass it as uint64 to avoid CSteamID hidden-pointer ABI issue
+                    uint64_t lobbyId = SafeVCall1i(mm, 11, 0);
+                    if (lobbyId != 0) {
+                        // slot 13 = JoinLobby(CSteamID) → returns SteamAPICall_t
+                        m_joinLobbyCall = SafeVCall2u64(mm, 13, lobbyId);
+                        LOG_INFO("Found %u lobby(ies) — joining %llu...",
+                                 result.m_nLobbiesMatching, lobbyId);
                     } else {
-                        LOG_WARNING("No lobby found for password '%s' (count=%u, failed=%d)",
-                                    m_sessionPassword.c_str(),
-                                    result.m_nLobbiesMatching, (int)failed);
-                        TransitionToState(SessionState::Error);
-                        UI::Overlay::GetInstance().ShowNotification(
-                            "Aucun lobby trouve — l'hote est-il en ligne ?", 5.0f);
+                        LOG_ERROR("GetLobbyByIndex returned 0");
+                        TransitionToState(SessionState::Connected);
                     }
+                } else {
+                    LOG_WARNING("No lobby found for password '%s' (count=%u)",
+                                m_sessionPassword.c_str(), result.m_nLobbiesMatching);
+                    // Stay Connected — protobuf hooks are still active
+                    TransitionToState(SessionState::Connected);
+                    UI::Overlay::GetInstance().ShowNotification(
+                        "Aucun lobby trouve (hote pas encore pret?) — seamless actif.", 5.0f);
                 }
             }
 
             // ── JoinLobby result (joiner) ─────────────────────────────────
-            if (m_joinLobbyCall != 0) {
-                if (SteamUt::IsAPICallCompleted(utils, m_joinLobbyCall, &failed)) {
-                    LobbyEnter_t result{};
-                    SteamUt::GetAPICallResult(utils, m_joinLobbyCall,
-                        &result, sizeof(result), LobbyEnter_t::k_iCallback, &failed);
-                    m_joinLobbyCall = 0;
+            if (m_joinLobbyCall != 0 &&
+                SafeIsCallCompleted(utils, m_joinLobbyCall, &failed)) {
 
-                    if (!failed && result.m_EChatRoomEnterResponse == 1 /* success */) {
-                        m_currentLobbyId = result.m_ulSteamIDLobby;
+                LobbyEnter_t result{};
+                SafeGetCallResult(utils, m_joinLobbyCall,
+                    &result, sizeof(result), LobbyEnter_t::k_iCallback, &failed);
+                m_joinLobbyCall = 0;
 
-                        CSteamID hostId = SteamMM::GetLobbyOwner(
-                            mm, CSteamID(m_currentLobbyId));
-
-                        auto& peerMgr = Network::PeerManager::GetInstance();
-                        peerMgr.SetCurrentLobby(m_currentLobbyId);
-                        peerMgr.JoinSession(hostId.ConvertToUint64(), m_sessionPassword);
-
-                        TransitionToState(SessionState::Connected);
-                        LOG_INFO("Joined lobby %llu, host SteamID=%llu",
-                                 m_currentLobbyId, hostId.ConvertToUint64());
-                        UI::Overlay::GetInstance().ShowNotification(
-                            "Lobby rejoint ! En attente de l'hote...", 5.0f);
-                    } else {
-                        LOG_ERROR("JoinLobby failed (response=%u, failed=%d)",
-                                  result.m_EChatRoomEnterResponse, (int)failed);
-                        TransitionToState(SessionState::Error);
-                        UI::Overlay::GetInstance().ShowNotification(
-                            "Impossible de rejoindre le lobby Steam.", 5.0f);
-                    }
+                if (!failed && result.m_EChatRoomEnterResponse == 1) {
+                    m_currentLobbyId = result.m_ulSteamIDLobby;
+                    LOG_INFO("Joined lobby %llu", m_currentLobbyId);
+                    TransitionToState(SessionState::Connected);
+                    UI::Overlay::GetInstance().ShowNotification(
+                        "Lobby rejoint ! Utilise la pierre blanche pour invoquer.", 6.0f);
+                    UI::Overlay::GetInstance().ShowCenteredNotification(
+                        "Mode seamless ACTIF", 4.0f, 1);
+                } else {
+                    LOG_ERROR("JoinLobby failed (response=%u, failed=%d)",
+                              result.m_EChatRoomEnterResponse, (int)failed);
+                    TransitionToState(SessionState::Connected);
+                    UI::Overlay::GetInstance().ShowNotification(
+                        "Lobby introuvable — seamless actif, utilise la pierre blanche.", 5.0f);
                 }
             }
         }
@@ -353,11 +468,7 @@ void SessionManager::Update(float deltaTime) {
 
     if (!IsActive()) return;
 
-    // Update networking (receive packets, send heartbeats)
-    auto& peerMgr = Network::PeerManager::GetInstance();
-    peerMgr.Update();
-
-    // Update player sync (reads game memory, broadcasts position/state)
+    // Update player sync (reads game memory: HP, position, etc.)
     auto& playerSync = Sync::PlayerSync::GetInstance();
     playerSync.Update(deltaTime);
 }

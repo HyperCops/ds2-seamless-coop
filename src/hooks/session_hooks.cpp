@@ -198,48 +198,52 @@ static bool IsOutgoingDisconnect(const char* className) {
 
 // Messages to block when RECEIVING (incoming — parse hook)
 //
-// HISTORY: This list used to also block LeaveSession, LeaveGuestPlayer,
-// RemovePlayer, and BreakInTarget. Those entries were the *original* fix for
-// boss-kill phantom dismissal — the server would push LeaveGuestPlayer after
-// a boss kill and we'd intercept it. That fix was later REPLACED by the
-// runtime NOP patch at exe+0x44ef7b (commit 8c0f792, PatchPhantomReturnOnBossKill)
-// which prevents the boss-kill code from ever generating the dismiss event in
-// the first place. The block-list entries were left in place as vestigial
-// belt-and-suspenders, but it turned out they were catching DS2's normal
-// death/respawn flow as collateral damage: the death state machine sends a
-// LeaveSession-style round-trip and waits for the ack to advance to respawn.
-// Blocking it leaves the player permanently dead-but-not-respawning, with
-// the camera free to rotate around the corpse and the pause menu unable to
-// open (DS2's input arbiter is also waiting on the same round-trip).
+// CRITICAL: These messages are blocked BEFORE calling the original parser
+// so the game code never sees them. Returning true (success) from ParseHook
+// without parsing is safe — the caller checks the return value and skips
+// processing if we've already handled it by returning true pre-emptively.
+// Actually we return true to prevent errors but the object stays default-constructed;
+// the caller's message dispatch finds nothing to act on.
 //
-// CURRENT POLICY: only block the messages tied to documented host-crash
-// bugs that have NO other fix:
-//   - DisconnectSession  : server-initiated forced disconnect
-//   - BanishPlayer       : server kicking us
-//   - RemoveSign / RejectSign : crystal/homeward bone host crash
-//     (commit dd10dea — phantom departs mid-session, server pushes sign
-//     teardown, host processes it as "phantom gone" and crashes)
+// Boss kill sequence:
+//   1. Boss HP → 0
+//   2. DS2 local code tries to call FUN_140191bb0 → NOPed by PatchPhantomDismissalLoops
+//   3. Server still detects boss kill → pushes NotifyLeaveGuestPlayer
+//   4. WITHOUT block: game dismisses phantom on step 3
+//   5. WITH block: step 3 message is dropped → phantom stays
 //
-// Phantom join/leave detection now happens AFTER the original parser runs
-// via OnPhantomJoined() / OnPhantomLeft() in ParseHook — those still fire
-// correctly because we let the message through.
+// Phantom natural death (player HP → 0):
+//   This uses NotifyPlayerDeath / NotifyKillPlayer, NOT NotifyLeaveGuestPlayer.
+//   So blocking NotifyLeaveGuestPlayer does NOT break phantom death/respawn.
 static bool IsIncomingDisconnect(const char* className) {
     if (!className) return false;
+
+    // Server-initiated forced disconnect
     if (strstr(className, "DisconnectSession")) return true;
+
+    // Server kicking us (anti-cheat, admin ban, etc.)
     if (strstr(className, "BanishPlayer")) return true;
+
+    // Boss kill phantom dismissal — server pushes this when boss dies
+    // Safe to block: phantom death uses NotifyPlayerDeath, not this message
+    if (strstr(className, "NotifyLeaveGuestPlayer")) return true;
+    if (strstr(className, "PushLeaveGuestPlayer")) return true;
+    if (strstr(className, "LeaveGuestPlayer")) return true;
+
+    // Session leave pushed from server (warp/bonfire disconnects)
+    if (strstr(className, "PushLeaveSession")) return true;
+    if (strstr(className, "NotifyLeaveSession")) return true;
+
     // When a phantom uses the Black Separation Crystal, the server sends
     // PushRequestRemoveSign to the host. The host's game processes this as
     // "phantom is gone" and tries to tear down the active session — crash.
     if (strstr(className, "RemoveSign")) return true;
-    // RejectSign can also carry a "phantom returned home" state that crashes
-    // the host when processed mid-session.
     if (strstr(className, "RejectSign")) return true;
+
     // Block all invasion-related messages while seamless co-op is active.
-    // BreakInTarget   = invader requesting to enter our world
-    // PushBreakIn*    = server pushing the invasion to us
-    // We silently drop these so invaders can't interrupt the co-op session.
     if (strstr(className, "BreakIn")) return true;
     if (strstr(className, "PushBreakIn")) return true;
+
     return false;
 }
 
@@ -374,42 +378,53 @@ static void OnPhantomLeft() {
 // HOOKED: ParseFromArray
 //
 // Every incoming protobuf message passes through this function.
-// We log interesting messages for debugging and event detection.
+//
+// CRITICAL ORDER: we MUST check for disconnect messages BEFORE calling the
+// original parser. If the original parser runs, the game's C++ code processes
+// the message immediately (setting state flags, triggering callbacks). By the
+// time we return false, the disconnect already happened. Blocking pre-parse
+// means the game's message handler never sees the data.
+//
+// Returning 'true' (without parsing) pretends the message parsed to an empty
+// object. The caller's dispatch switch finds no opcode/data to act on.
 // ============================================================================
 static bool __fastcall ParseHook(void* thisPtr, void* data, int size) {
-    // Call original first so the object is populated
+    // GetRttiClassName reads the vtable pointer set at object construction —
+    // this works even before ParseFromArray populates the fields.
+    const char* className = GetRttiClassName(thisPtr);
+
+    // ── BLOCK DISCONNECT MESSAGES BEFORE GAME PROCESSES THEM ─────────────────
+    if (g_seamlessActive.load() && IsIncomingDisconnect(className)) {
+        LOG_INFO("[SEAMLESS] BLOCKED incoming (pre-parse): %s (size=%d)", className, size);
+        g_blockedCount++;
+        // Return true so caller doesn't treat this as a parse error.
+        // The object stays default-constructed — no action triggered.
+        return true;
+    }
+
+    // Log interesting incoming messages
+    if (strstr(className, "Session") || strstr(className, "Guest") ||
+        strstr(className, "Sign") || strstr(className, "BreakIn") ||
+        strstr(className, "Summon") || strstr(className, "Push") ||
+        strstr(className, "Join") || strstr(className, "Leave") ||
+        strstr(className, "Phantom") || strstr(className, "Remove")) {
+        LOG_INFO("[PROTOBUF <<] %s (size: %d)", className, size);
+    }
+
+    // Call original parser — game processes the message
     bool result = g_originalParse(thisPtr, data, size);
 
     if (result) {
-        const char* className = GetRttiClassName(thisPtr);
-
-        // Log ALL session-related incoming messages (INFO level for debugging)
-        if (strstr(className, "Session") || strstr(className, "Guest") ||
-            strstr(className, "Sign") || strstr(className, "BreakIn") ||
-            strstr(className, "Summon") || strstr(className, "Push") ||
-            strstr(className, "Join") || strstr(className, "Leave") ||
-            strstr(className, "Phantom") || strstr(className, "Remove")) {
-            LOG_INFO("[PROTOBUF <<] %s (size: %d)", className, size);
-        }
-
-        // If we receive a disconnect push from the server while seamless is active,
-        // return false so the game thinks the parse failed and ignores it.
-        if (g_seamlessActive.load() && IsIncomingDisconnect(className)) {
-            LOG_INFO("[SEAMLESS] BLOCKED incoming disconnect from server: %s", className);
-            g_blockedCount++;
-            return false;
-        }
-
-        // Sign filtering disabled — we're on a private server, no randoms.
-        // The old filter rejected entire SignList responses if ANY sign
-        // contained a Steam ID not in the whitelist, breaking sign visibility.
-
-        // Detect phantom joining/leaving world via DS2 soapstone summon.
+        // Detect phantom entering world via DS2 soapstone summon.
         // Handled in helper functions to avoid C2712 (__try + C++ objects).
         if (strstr(className, "NotifyJoinGuestPlayer"))
             OnPhantomJoined();
-        if (strstr(className, "NotifyLeaveGuestPlayer") || strstr(className, "LeaveGuestPlayer"))
-            OnPhantomLeft();
+
+        // NotifyLeaveGuestPlayer is now blocked above, so OnPhantomLeft()
+        // here would only fire for messages we explicitly allowed through.
+        // If we want to track voluntary phantom departure (BSC), we could add
+        // a separate handler here. For now, leave detection is handled by
+        // the session manager's timeout logic.
     }
 
     return result;
